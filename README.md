@@ -206,6 +206,14 @@ python analyzer.py --help    # CLI ヘルプ
 
 ---
 
+## 📄 ライセンス
+
+[MIT License](LICENSE)
+
+同梱している Chart.js（`chart.umd.min.js`）は MIT License、exe に含まれる OpenCV は Apache License 2.0、NumPy は BSD 3-Clause License です。
+
+---
+
 ## 📝 更新履歴
 
 | バージョン | 内容 |
