@@ -282,6 +282,101 @@ class RepTests(unittest.TestCase):
             an.parse_rep(rep)
 
 
+class CardTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def _frames(self, hands, side_name="p1", acts=None, match=1):
+        """hands の並びを 20 フレームずつ続けた記録"""
+        frames = []
+        for n, hand in enumerate(hands):
+            for k in range(20):
+                i = n * 20 + k
+                me = side(act=(acts or {}).get(n, 0))
+                me["hand"] = list(hand)
+                other = side()
+                other["hand"] = []
+                frames.append({"t": round(i / 60, 4), "f": i, "match": match,
+                               side_name: me, "p2" if side_name == "p1" else "p1": other})
+        return frames
+
+    def test_rep_decks_are_read_for_both_players(self):
+        rep = self.tmp / "a.rep"
+        make_rep(rep, 3, [0x10, 0x80] * 10)
+        self.assertEqual(an.read_rep_decks(rep), [list(range(20)), list(range(20))])
+
+    def test_names_come_from_the_table_and_unknown_ids_keep_the_number(self):
+        self.assertEqual(an.card_name("reimu", 0), "「霊撃札」")
+        self.assertEqual(an.card_name("reimu", 201), "神霊「夢想封印」")
+        self.assertEqual(an.card_name("reimu", 199), "カード(199)")
+        self.assertEqual(an.card_name(None, 201), "カード(201)")
+        self.assertEqual([an.card_kind(c) for c in (20, 100, 200)], ["system", "skill", "spell"])
+
+    def test_use_is_counted_but_cycling_and_drawing_are_not(self):
+        hands = [
+            [], [207],                    # 引く
+            [207, 12], [12, 207],         # 引く → 送る
+            [207, 12], [],                # 送る → スペル（コストのカードも消える）
+            [104], [],                    # 引く → スキルカード
+            [0, 100], [100],              # 引く → システムカード
+        ]
+        uses = an.count_card_uses(self._frames(hands))
+        self.assertEqual(dict(uses["p1"]), {207: 1, 104: 1, 0: 1})
+        self.assertEqual(dict(uses["p2"]), {})
+
+    def test_hand_replaced_by_weather_is_not_a_use(self):
+        # 実記録にあった形: 枚数はそのままで中身が入れ替わる
+        uses = an.count_card_uses(self._frames([[202, 12, 12, 12, 12], [102, 12, 12, 102, 12]]))
+        self.assertEqual(dict(uses["p1"]), {})
+
+    def test_gourd_is_one_use_and_its_two_draws_are_not(self):
+        uses = an.count_card_uses(self._frames([[9, 14], [14], [14, 100], [14, 100, 11]]))
+        self.assertEqual(dict(uses["p1"]), {9: 1})
+
+    def test_card_broken_while_being_hit_is_not_a_use(self):
+        uses = an.count_card_uses(self._frames([[200, 100], [100]], acts={1: 70}))
+        self.assertEqual(dict(uses["p1"]), {})
+
+    def test_hand_is_not_compared_across_matches(self):
+        frames = self._frames([[200, 100]], match=1) + self._frames([[]], match=2)
+        self.assertEqual(dict(an.count_card_uses(frames)["p1"]), {})
+
+    def test_old_records_fall_back_to_spell_actions(self):
+        frames = make_round(0, 0.0)
+        self.assertIsNone(an.count_card_uses(frames))
+        for f in frames[100:130]:
+            f["p2"]["act"] = 607
+        self.assertEqual(dict(an.count_spell_uses_from_acts(frames)["p2"]), {207: 1})
+
+    def test_same_deck_matches_are_merged_and_different_ones_are_not(self):
+        groups = [self._frames([[200], []], match=1), self._frames([[200], []], match=2)]
+        chars = [("reimu", "aya"), ("reimu", "aya")]
+        same = [{"match": m, "p1_deck": [200, 0], "p2_deck": [12]} for m in (1, 2)]
+        merged = an.card_summaries_from_live(groups, same, chars)
+        self.assertEqual([(cs.title, dict(cs.uses[0])) for cs in merged], [("全2試合の合計", {200: 2})])
+        other = [same[0], {"match": 2, "p1_deck": [200, 1], "p2_deck": [12]}]
+        split = an.card_summaries_from_live(groups, other, chars)
+        self.assertEqual([cs.title for cs in split], ["試合1", "試合2"])
+
+    def test_report_lists_deck_and_uses_by_card_name(self):
+        frames = make_round(0, 0.0)
+        for i, f in enumerate(frames):
+            f["p1"]["hand"] = [201, 0] if i < 300 else []
+            f["p2"]["hand"] = []
+        live = self.tmp / "cards.json"
+        live.write_text(json.dumps({"meta": {"version": 5, "matches": [{
+            "match": 1, "p1_char": "reimu", "p2_char": "aya",
+            "p1_deck": [0, 0, 201], "p2_deck": [12, 100],
+        }]}, "frames": frames}), encoding="utf-8")
+        out = self.tmp / "cards.html"
+        an.analyze(None, None, out, live)
+        report = out.read_text(encoding="utf-8")
+        self.assertIn("<td>神霊「夢想封印」</td><td style=\"text-align:center\">1枚</td>"
+                      "<td style=\"text-align:center\"><b>1回</b></td>", report)
+        self.assertIn("<td>「霊撃札」</td><td style=\"text-align:center\">2枚</td>", report)
+        self.assertIn("疾風扇", report)
+
+
 class RepSyncTests(unittest.TestCase):
     """.rep と動画の時刻合わせ"""
 

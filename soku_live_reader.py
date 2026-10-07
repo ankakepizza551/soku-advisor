@@ -58,6 +58,13 @@ CF_FRAME_COUNT       = 0x144  # int: アクション経過フレーム数
 CF_POS_X             = 0xEC   # float: 横位置
 CF_POS_Y             = 0xF0   # float: 高さ
 CF_DIRECTION         = 0x104  # char: 向き（1=右向き, -1=左向き）
+# カード（オフセットは SokuLib の CharacterManager / Cards.hpp による）。
+# どれも {予備, ブロック表, 表の長さ, 先頭位置, 要素数} の5個（各4バイト）が並ぶキュー。
+CF_DECK_ORIGINAL     = 0x59C  # 試合開始時のデッキ（u16 のカード番号、1ブロック8個）
+CF_HAND              = 0x5E8  # 手札（1ブロックにカード1枚。カードの先頭2バイトが番号）
+DECK_BLOCK = 8       # デッキのキューで1ブロックに入る枚数
+DECK_MAX = 20
+HAND_MAX = 5
 
 # 入力オフセット（各値はint型）
 # 注意: 定数名は歴史的経緯で PRESSED / HELD だが、実機の記録で確認した意味は以下。
@@ -244,6 +251,57 @@ def read_float(proc, addr: int) -> Optional[float]:
     if b is None:
         return None
     return struct.unpack("<f", b)[0]
+
+
+def _read_queue(proc, addr: int, max_size: int) -> Optional[tuple[list[int], int, int]]:
+    """キューの (ブロック表, 先頭位置, 要素数) を読む。読めない・値がおかしい時は None。"""
+    head = _read_mem(proc, addr, 20)
+    if head is None:
+        return None
+    _, table_ptr, table_len, first, size = struct.unpack("<5I", head)
+    if size == 0:
+        return [], first, 0
+    if size > max_size or not table_ptr or not 0 < table_len <= 64:
+        return None
+    raw = _read_mem(proc, table_ptr, table_len * 4)
+    if raw is None:
+        return None
+    return list(struct.unpack(f"<{table_len}I", raw)), first, size
+
+
+def read_deck(proc, char_ptr: int) -> Optional[list[int]]:
+    """試合開始時のデッキ（カード番号の並び）。読めなければ None。"""
+    queue = _read_queue(proc, char_ptr + CF_DECK_ORIGINAL, DECK_MAX)
+    if queue is None:
+        return None
+    table, first, size = queue
+    blocks: dict[int, bytes] = {}
+    cards = []
+    for i in range(first, first + size):
+        ptr = table[(i // DECK_BLOCK) % len(table)]
+        if ptr not in blocks:
+            raw = _read_mem(proc, ptr, DECK_BLOCK * 2) if ptr else None
+            if raw is None:
+                return None
+            blocks[ptr] = raw
+        cards.append(struct.unpack_from("<H", blocks[ptr], (i % DECK_BLOCK) * 2)[0])
+    return cards
+
+
+def read_hand(proc, char_ptr: int) -> Optional[list[int]]:
+    """手札のカード番号を先頭（次に使うカード）から順に返す。読めなければ None。"""
+    queue = _read_queue(proc, char_ptr + CF_HAND, HAND_MAX)
+    if queue is None:
+        return None
+    table, first, size = queue
+    cards = []
+    for i in range(first, first + size):
+        ptr = table[i % len(table)]
+        raw = _read_mem(proc, ptr, 2) if ptr else None
+        if raw is None:
+            return None
+        cards.append(struct.unpack("<H", raw)[0])
+    return cards
 
 
 # =====================================================================
@@ -443,7 +501,8 @@ class LiveRecorder:
         self.frame_count = 0
         self.in_battle = False
         self.match_id = 0
-        self.match_chars: list[dict] = []  # 試合ごとの {"match", "p1_char", "p2_char"}
+        # 試合ごとの {"match", "p1_char", "p2_char", "p1_deck", "p2_deck"}
+        self.match_chars: list[dict] = []
 
     def _read_char(self, addr: int) -> Optional[str]:
         """選択キャラ番号を char_data.json のIDにして返す。範囲外・読めない時は None。"""
@@ -511,6 +570,16 @@ class LiveRecorder:
         if p1 is None or p2 is None:
             return True
 
+        # デッキは対戦画面に入ってキャラが用意できてから読める。試合ごとに1回だけ読む
+        match_info = self.match_chars[-1]
+        for side, ptr in (("p1", p1_char_ptr), ("p2", p2_char_ptr)):
+            if f"{side}_deck" not in match_info:
+                deck = read_deck(self.proc, ptr)
+                if deck:
+                    match_info[f"{side}_deck"] = deck
+        p1_hand = read_hand(self.proc, p1_char_ptr)
+        p2_hand = read_hand(self.proc, p2_char_ptr)
+
         now = time.time()
         elapsed = now - self.start_time if self.start_time else 0.0
         if self.start_time is None:
@@ -526,12 +595,14 @@ class LiveRecorder:
                 "sp": p1.spirit,
                 "act": p1.action_id,
                 **encode_input(p1),
+                **({} if p1_hand is None else {"hand": p1_hand}),
             },
             "p2": {
                 "hp": p2.hp,
                 "sp": p2.spirit,
                 "act": p2.action_id,
                 **encode_input(p2),
+                **({} if p2_hand is None else {"hand": p2_hand}),
             },
         }
         self.frames.append(frame_data)
@@ -543,7 +614,8 @@ class LiveRecorder:
         meta = {
             # 3: p1/p2 に x, y（方向の押下フレーム数）、meta に matches（キャラ）を追加
             # 4: p1/p2 に px, py（位置）、face（向き）を追加
-            "version": 4,
+            # 5: p1/p2 に hand（手札）、meta.matches に p1_deck, p2_deck（デッキ）を追加
+            "version": 5,
             "recorded_at": datetime.now().isoformat(),
             "total_frames": self.frame_count,
             "match_count": self.match_id,

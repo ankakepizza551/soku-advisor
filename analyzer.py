@@ -1148,21 +1148,36 @@ def generate_session_advice(
     return advice
 
 
+def _read_rep_players(data: bytes) -> tuple[list[Optional[str]], list[list[int]], int]:
+    """.rep のヘッダから ([P1キャラ, P2キャラ], [P1デッキ, P2デッキ], 入力数の位置) を読む。"""
+    chars: list[Optional[str]] = []
+    decks: list[list[int]] = []
+    pos = REP_P1_OFS
+    for _ in range(2):
+        char_no = data[pos]
+        chars.append(REP_CHAR_IDS[char_no] if char_no < len(REP_CHAR_IDS) else None)
+        deck = struct.unpack_from("<I", data, pos + 2)[0]
+        if deck > REP_DECK_MAX:
+            raise ValueError("deck size")
+        decks.append(list(struct.unpack_from(f"<{deck}H", data, pos + 6)))
+        pos += 6 + deck * 2 + 3
+    return chars, decks, pos + 10 - 3
+
+
+def read_rep_decks(rep_path: Path) -> list[list[int]]:
+    """.rep から [P1デッキ, P2デッキ]（カード番号の並び）を読む。"""
+    try:
+        return _read_rep_players(rep_path.read_bytes())[1]
+    except (IndexError, ValueError, struct.error):
+        raise AnalyzeError(f".rep の形式が想定と違うため読めませんでした: {rep_path.name}")
+
+
 def read_rep_inputs(rep_path: Path) -> tuple[list[tuple[int, ...]], list[Optional[str]]]:
     """.rep から (プレイヤーごとの入力列, [P1キャラ, P2キャラ]) を読む。
     入力列は対人なら [P1, P2]、対CPU なら [P1] だけ。"""
     data = rep_path.read_bytes()
     try:
-        chars: list[Optional[str]] = []
-        pos = REP_P1_OFS
-        for _ in range(2):
-            char_no = data[pos]
-            chars.append(REP_CHAR_IDS[char_no] if char_no < len(REP_CHAR_IDS) else None)
-            deck = struct.unpack_from("<I", data, pos + 2)[0]
-            if deck > REP_DECK_MAX:
-                raise ValueError("deck size")
-            pos += 6 + deck * 2 + 3
-        pos += 10 - 3
+        chars, _, pos = _read_rep_players(data)
         count = struct.unpack_from("<I", data, pos)[0]
         if len(data) - (pos + 4) != count * 2:
             raise ValueError("input count")
@@ -1200,6 +1215,137 @@ def parse_rep(rep_path: Path, p1_name: str = "P1", p2_name: str = "P2") -> list[
             p2_char=chars[1],
         ))
     return result
+
+
+# ────────────────────────────────────────────
+# カード（デッキ構成と使用回数）
+# ────────────────────────────────────────────
+# カード番号は 0〜99 がシステムカード（全キャラ共通）、100〜199 がスキルカード、200〜 がスペルカード。
+# 名前は card_data.json から引く（ゲームの data/csv/<キャラ>/spellcard.csv から抜き出したもの）。
+CARD_FILE = "card_data.json"
+CARD_KINDS = [("spell", "スペルカード"), ("skill", "スキルカード"), ("system", "システムカード")]
+# スペルカード 200〜219 を使った時のアクションID は 600〜619（実記録で 607↔207、602↔202 を確認）
+ACT_SPELL_USE = range(600, 620)
+# 1回使った後、このフレーム数のあいだは手札が減っても数えない
+# （スペルカードのコストぶんのカードが、記録の上で1フレーム遅れて消えても二重に数えないため）
+CARD_USE_GAP = 10
+
+_CARD_CACHE: Optional[dict] = None
+
+
+def _card_data() -> dict:
+    global _CARD_CACHE
+    if _CARD_CACHE is None:
+        base = Path(sys._MEIPASS) if getattr(sys, "frozen", False) else Path(__file__).parent
+        try:
+            _CARD_CACHE = json.loads((base / CARD_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _CARD_CACHE = {}
+    return _CARD_CACHE
+
+
+def card_kind(card_id: int) -> str:
+    return "system" if card_id < 100 else "skill" if card_id < 200 else "spell"
+
+
+def card_name(char_id: Optional[str], card_id: int) -> str:
+    """カード名。表に無い番号は「カード(123)」のように出す"""
+    table = _card_data().get("common" if card_id < 100 else char_id or "", {})
+    return table.get(str(card_id)) or f"カード({card_id})"
+
+
+def count_card_uses(frames: list[dict]) -> Optional[dict[str, Counter]]:
+    """両者が使ったカードの回数（キーはカード番号）。手札の記録（version 5 以降）が無ければ None。
+
+    手札は先頭が次に使うカード。使うと先頭から消え、スペルカードはコストぶんのカードも
+    同時に消える（実記録で確認）。なので手札の枚数が減った時の、直前の先頭のカードを数える。
+    カードを送るだけの時は並びが回るだけ、引いた時は後ろに増えるだけで、どちらも数えない。
+    天候で手札が入れ替わる時（実記録では両者同時に中身が変わった）も枚数は同じなので数えない。
+    伊吹瓢は使った20フレームほど後に2枚引くので、使った時には1枚減る。
+    """
+    if not any("hand" in f["p1"] or "hand" in f["p2"] for f in frames):
+        return None
+    uses = {"p1": Counter(), "p2": Counter()}
+    for side in ("p1", "p2"):
+        prev: Optional[list] = None
+        prev_match = None
+        last_use = -CARD_USE_GAP
+        for i, frame in enumerate(frames):
+            hand = frame[side].get("hand")
+            if frame.get("match") != prev_match:
+                prev, prev_match = None, frame.get("match")
+            if hand is None:
+                continue
+            if prev and len(hand) < len(prev) and i - last_use >= CARD_USE_GAP:
+                # 被弾中に減るのは、相手の符蝕薬で先頭のカードを壊された時
+                if act_category(frame[side].get("act")) != "hit":
+                    uses[side][prev[0]] += 1
+                    last_use = i
+            prev = hand
+    return uses
+
+
+def count_spell_uses_from_acts(frames: list[dict]) -> dict[str, Counter]:
+    """手札の入っていない古い記録用。アクションID から、使ったスペルカードだけ数える。"""
+    uses = {"p1": Counter(), "p2": Counter()}
+    for side in ("p1", "p2"):
+        prev = None
+        for frame in frames:
+            act = frame[side].get("act")
+            if act != prev and act in ACT_SPELL_USE:
+                uses[side][act - ACT_SPELL_USE.start + 200] += 1
+            prev = act
+    return uses
+
+
+@dataclass
+class CardSummary:
+    """レポートの「カード」欄1つぶん（1試合、またはデッキが同じ連戦の合計）"""
+    chars: tuple                      # (P1キャラ, P2キャラ)
+    decks: tuple = (None, None)       # (P1デッキ, P2デッキ)。分からない側は None
+    uses: Optional[tuple] = None      # (P1, P2) の使用回数 Counter。分からない記録では None
+    spells_only: bool = False         # 使用回数がスペルカードだけ（手札の無い古い記録）
+    title: str = ""                   # 連戦で試合ごとに分ける時の見出し
+
+    def has_data(self) -> bool:
+        return any(self.decks) or bool(self.uses and any(self.uses))
+
+
+def card_summaries_from_live(
+    match_groups: list[list[dict]],
+    recorded_matches: list[dict],
+    match_chars: list[tuple],
+) -> list[CardSummary]:
+    """ライブ記録の試合ごとのカード欄。キャラもデッキも同じ連戦は、1つにまとめて合計を出す。"""
+    rec_by_id = {m.get("match"): m for m in recorded_matches}
+    summaries = []
+    for n, (group, chars) in enumerate(zip(match_groups, match_chars), start=1):
+        rec = rec_by_id.get(group[0].get("match"), {})
+        uses = count_card_uses(group)
+        spells_only = uses is None
+        if uses is None:
+            uses = count_spell_uses_from_acts(group)
+        summaries.append(CardSummary(
+            chars=chars,
+            decks=(rec.get("p1_deck"), rec.get("p2_deck")),
+            uses=(uses["p1"], uses["p2"]),
+            spells_only=spells_only,
+            title=f"試合{n}",
+        ))
+    if not summaries:
+        return []
+
+    def key(cs: CardSummary):
+        return cs.chars, tuple(tuple(sorted(d)) if d else None for d in cs.decks), cs.spells_only
+
+    if len({key(cs) for cs in summaries}) == 1:
+        first = summaries[0]
+        total = tuple(sum((cs.uses[i] for cs in summaries), Counter()) for i in range(2))
+        summaries = [CardSummary(
+            chars=first.chars, decks=first.decks, uses=total, spells_only=first.spells_only,
+            title=f"全{len(summaries)}試合の合計" if len(summaries) > 1 else "",
+        )]
+    return [cs for cs in summaries if cs.has_data()]
 
 
 # ────────────────────────────────────────────
@@ -1693,6 +1839,71 @@ document.querySelectorAll('a.seek').forEach(a => {{
 </html>
 """
 
+def _build_card_table(cs: CardSummary, player: int, name: str) -> str:
+    """1プレイヤー分のカード表。name はエスケープ済み"""
+    char = cs.chars[player]
+    deck = Counter(cs.decks[player] or [])
+    uses = cs.uses[player] if cs.uses else Counter()
+    show_deck, show_uses = bool(deck), cs.uses is not None
+    head = '<th style="text-align:left">カード</th>'
+    head += "<th>デッキ</th>" if show_deck else ""
+    head += "<th>使用</th>" if show_uses else ""
+    rows = ""
+    for kind, label in CARD_KINDS:
+        ids = sorted(c for c in set(deck) | set(uses) if card_kind(c) == kind)
+        if not ids:
+            continue
+        rows += f'<tr><td colspan="3" style="color:#aaa">{label}</td></tr>'
+        for c in ids:
+            rows += f"<tr><td>{html.escape(card_name(char, c))}</td>"
+            if show_deck:
+                count = f"{deck[c]}枚" if deck[c] else "—"
+                rows += f'<td style="text-align:center">{count}</td>'
+            if show_uses:
+                used = f"<b>{uses[c]}回</b>" if uses[c] else '<span style="color:#555">0回</span>'
+                rows += f'<td style="text-align:center">{used}</td>'
+            rows += "</tr>"
+    if not rows:
+        rows = '<tr><td colspan="3" style="color:#888">記録がありません</td></tr>'
+    total = f" — 使用 計{sum(uses.values())}回" if show_uses else ""
+    return (
+        f'<div><div style="font-size:.85rem;margin-bottom:4px">{name}'
+        f'（{html.escape(char_display_name(char))}）{total}</div>'
+        f'<table class="session-table"><tr>{head}</tr>{rows}</table></div>'
+    )
+
+
+def _build_card_section(
+    summaries: list[CardSummary], p1_name: str, p2_name: str, viewpoint: int,
+) -> str:
+    """デッキ構成とカードの使用回数。名前はエスケープ済みのものを受け取る"""
+    if not summaries:
+        return ""
+    order = (0, 1) if viewpoint == 1 else (1, 0)   # 自分を左に出す
+    names = (p1_name, p2_name)
+    body = ""
+    for cs in summaries:
+        if cs.title:
+            body += f'<div class="match-section"><h3>{html.escape(cs.title)}</h3>'
+        body += '<div class="grid" style="margin-bottom:0">'
+        body += "".join(_build_card_table(cs, i, names[i]) for i in order)
+        body += "</div>"
+        if cs.title:
+            body += "</div>"
+    notes = []
+    if any(cs.uses is None for cs in summaries):
+        notes.append(".rep にはデッキしか入っていないため、使用回数は出ません（ライブ記録を使った解析で出ます）")
+    if any(cs.spells_only for cs in summaries):
+        notes.append("この記録には手札が入っていないため、使用回数はスペルカードだけ・デッキは無しです"
+                     "（新しい版で取ったライブ記録なら全部出ます）")
+    note = "".join(f'<div style="color:#888;font-size:.75rem;margin-top:8px">{n}</div>' for n in notes)
+    return f"""
+<div class="card" style="margin-top:16px">
+<h2>🃏 カード（デッキ構成と使用回数）</h2>
+{body}{note}
+</div>"""
+
+
 def _build_live_input_section(ls: "LiveStats", name: str, color_class: str) -> str:
     """ライブ記録の1プレイヤー分の入力セクションHTML"""
     tf = ls.total_frames
@@ -2091,6 +2302,7 @@ def build_html(
     rep_opp: Optional[RepStats] = None,
     video_src: str = "",
     to_video: ToVideo = None,
+    card_summaries: Optional[list[CardSummary]] = None,
 ) -> str:
     """video_src（レポートから見た動画の場所）があれば動画を埋め込み、to_video で
     再生位置が分かる時刻をクリックで飛べるようにする。"""
@@ -2153,8 +2365,8 @@ def build_html(
             f'{SEEK_LEAD_SEC:.0f}秒手前から再生します</div></div>'
         )
 
-    # ── 入力セクション
-    input_section = ""
+    # ── カード → 入力セクション
+    input_section = _build_card_section(card_summaries or [], p1_name, p2_name, viewpoint)
     for rs, color in ((rep, "p1-color"), (rep_opp, "p2-color")):
         if not rs:
             continue
@@ -2424,6 +2636,21 @@ def analyze(
         self_char = p1_char if viewpoint == 1 else p2_char
         opp_char = p2_char if viewpoint == 1 else p1_char
 
+    # ── カード（デッキ構成と使用回数）
+    card_summaries: list[CardSummary] = []
+    if live_frames:
+        card_summaries = card_summaries_from_live(
+            match_groups, recorded_matches,
+            [(m.p1_char, m.p2_char) for m in matches] or [(p1_char, p2_char)],
+        )
+    elif rep_streams:
+        card_summaries = [CardSummary(chars=(p1_char, p2_char), decks=tuple(read_rep_decks(rep_path)))]
+    for cs in card_summaries:
+        if cs.uses:
+            label = f"{cs.title}: " if cs.title else ""
+            kind = "スペルカード" if cs.spells_only else "カード"
+            print(f"  {label}{kind}使用: P1 {sum(cs.uses[0].values())}回 / P2 {sum(cs.uses[1].values())}回")
+
     # ── ダメージイベント検出（ライブデータ時のみ）
     damage_events: list[DamageEvent] = []
     if live_frames and len(matches) <= 1:
@@ -2581,6 +2808,7 @@ def analyze(
         rep_opp=rep_opp,
         video_src=_video_src(video_path, out_path) if video_path else "",
         to_video=to_video,
+        card_summaries=card_summaries,
         # 試合ごとにキャラが違う時は、見出しには出さず各試合の欄に出す
         char_label=(
             f"{char_display_name(p1_char)} vs {char_display_name(p2_char)}"

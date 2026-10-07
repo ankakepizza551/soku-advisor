@@ -5,7 +5,7 @@ a = Analysis(
     ['soku_advisor_app.py'],
     pathex=[],
     binaries=[],
-    datas=[('analyzer.py', '.'), ('soku_live_reader.py', '.'), ('char_advisor.py', '.'), ('ai_advisor.py', '.'), ('char_data.json', '.'), ('chart.umd.min.js', '.'), ('soku_advisor.ico', '.')],
+    datas=[('analyzer.py', '.'), ('soku_live_reader.py', '.'), ('char_advisor.py', '.'), ('ai_advisor.py', '.'), ('char_data.json', '.'), ('card_data.json', '.'), ('chart.umd.min.js', '.'), ('soku_advisor.ico', '.')],
     hiddenimports=['cv2', 'numpy', 'tkinter', 'player_history'],
     hookspath=[],
     hooksconfig={},
