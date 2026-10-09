@@ -298,9 +298,72 @@ class DamageEvent:
     distance: Optional[int] = None  # 最初のヒットの時の相手との横の距離（位置のある記録のみ）
     cornered: bool = False      # 最初のヒットの時に画面端に追い込まれていたか（位置のある記録のみ）
     hit_act: Optional[int] = None   # 最初のヒットの時点の自分のアクションID（ライブ記録のみ）
+    opp_inputs: list = field(default_factory=list)  # prev_inputs と同じ区間の、相手側のフレームデータ（ライブ記録のみ）
+    own_names: dict = field(default_factory=dict)   # 自分のスキル・スペルカードの アクションID → 技名
 
-    def what_was_doing(self) -> str:
-        """直前行動のサマリー文字列を返す"""
+    def attack_context(self) -> Optional[tuple[str, int]]:
+        """自分の攻撃が絡んだ被弾なら (種類, その技のアクションID)。絡んでいなければ None。
+
+        種類は ATTACK_CONTEXT_LABELS のキー:
+          blocked … その連係を相手にガードされていた（反撃を受けた）
+          hit     … その連係が相手に当たっていた（コンボを落とした後など）
+          startup … 攻撃判定が出る前に食らった
+          clash   … 攻撃判定が出ている最中に食らった（打ち合いで負けた）
+          whiff   … 当たりもガードもされずに攻撃判定が終わり、その後の硬直に食らった
+        startup / clash / whiff は、攻撃判定の出ているフレームが入った記録（version 6 以降）で、
+        本体に攻撃判定の出る技の時だけ分けられる。それ以外（古い記録や弾を撃つ技）は、
+        どちらの技が先に始まったかで分ける:
+          first   … 相手の技は自分より後に始まっていた
+          late    … 相手の技が先に始まっていた
+        技が終わって立っているだけの時は、まだ技の途中に相手の技が始まっていた時だけ数える
+        （硬直が解けてから始まった技を食らったのは、その技のせいではない）。
+        """
+        mine = [f.get("act") for f in self.prev_inputs]
+        theirs = [f.get("act") for f in self.opp_inputs]
+        if not mine or len(mine) != len(theirs):
+            return None
+        last = len(mine) - 1
+        end = last
+        while end >= 0 and mine[end] in ACT_STANDING:
+            end -= 1
+        if end < 0 or act_category(mine[end]) not in ATTACK_CATEGORIES:
+            return None
+        # 自分に当たった相手の技（遡って最後に出していた攻撃）が始まったフレーム
+        opp_end = next((j for j in range(last, -1, -1)
+                        if act_category(theirs[j]) in ATTACK_CATEGORIES), None)
+        if opp_end is None:
+            return None
+        opp_start = opp_end
+        while opp_start > 0 and theirs[opp_start - 1] == theirs[opp_end]:
+            opp_start -= 1
+        if opp_start > end:
+            return None
+        start = end       # 連係（攻撃が途切れずに続いている区間）の頭
+        while start > 0 and act_category(mine[start - 1]) in ATTACK_CATEGORIES:
+            start -= 1
+        seen = {"guard" if guard_kind(act) else act_category(act) for act in theirs[start:]}
+        if "guard" in seen:
+            return "blocked", mine[end]
+        if "hit" in seen:
+            return "hit", mine[end]
+        if end < last:
+            return None
+        move_start = end  # 最後に出した技の頭
+        while move_start > start and mine[move_start - 1] == mine[end]:
+            move_start -= 1
+        boxes = [f.get("atk") for f in self.prev_inputs[move_start:]]
+        has_boxes = None not in boxes and (any(boxes) or act_category(mine[end]) == "melee")
+        if not has_boxes:
+            return ("late" if opp_start < move_start else "first"), mine[end]
+        if not any(boxes):
+            return "startup", mine[end]
+        return ("clash" if boxes[-1] else "whiff"), mine[end]
+
+    def what_was_doing(self, detail: bool = False) -> str:
+        """直前行動のサマリー文字列を返す。
+
+        detail にすると、自分の攻撃が絡んだ被弾を「打撃」ではなく技名（「6A」など）で出す。
+        """
         if not self.prev_inputs:
             return "不明"
         if self.estimated:
@@ -308,9 +371,14 @@ class DamageEvent:
         last_act = self.prev_inputs[-1].get("act")
         cat = act_category(last_act)
         own = ""
+        context = self.attack_context()
         # クラッシュした後の被弾も、クラッシュさせた攻撃そのもので HP が減った時も同じ扱い
         if last_act in ACT_GUARD_CRUSHES or self.hit_act in ACT_GUARD_CRUSHES:
             own = "ガードクラッシュ中"
+        elif context:
+            kind, act = context
+            name = _act_name(act, self.own_names.get(act)) if detail else ACT_LABELS[act_category(act)]
+            own = name + ATTACK_CONTEXT_LABELS[kind]
         elif cat == "move":
             own = MOVE_LABELS.get(last_act, ACT_LABELS[cat]) + "中"
         elif cat == "guard":
@@ -423,6 +491,7 @@ def detect_damage_events(frames: list[dict], fps: int = 60) -> list[DamageEvent]
                 hp_after=hp_after,
                 damage_pct=hp_before - hp_after,
                 prev_inputs=[frames[j][side] for j in range(max(0, start_i - window), start_i)],
+                opp_inputs=[frames[j][other] for j in range(max(0, start_i - window), start_i)],
                 target=side,
                 hits=hits,
                 spirit_before=frames[start_i - 1][side].get("sp") if start_i > 0 else None,
@@ -430,6 +499,7 @@ def detect_damage_events(frames: list[dict], fps: int = 60) -> list[DamageEvent]
                 opp_move=_act_name(opp_act, skill_names.get((other, opp_act))) if opp_act is not None else "",
                 after_down=after_down,
                 hit_act=me.get("act"),
+                own_names={act: name for (who, act), name in skill_names.items() if who == side},
             ))
 
         for i, frame in enumerate(frames):
@@ -528,16 +598,20 @@ def name_spell_moves(events: list[DamageEvent], p1_char: Optional[str], p2_char:
 
     カード名はキャラごとに違うので、キャラが分かってから呼ぶ。分からない時は番号のまま。
     """
-    for e in events:
-        if e.opp_act is None or act_category(e.opp_act) != "spell":
-            continue
-        attacker = p2_char if e.target == "p1" else p1_char
-        offset = e.opp_act - ACT_SPELL_USE.start
+    def spell_name(char: Optional[str], act: int) -> Optional[str]:
+        offset = act - ACT_SPELL_USE.start
         # 650〜669 は同じカードの別のアクション（発動後の効果など）
-        card = 200 + (offset - 50 if offset >= 50 else offset)
-        name = card_name(attacker, card)
-        if not name.startswith("カード("):
-            e.opp_move = name
+        name = card_name(char, 200 + (offset - 50 if offset >= 50 else offset))
+        return None if name.startswith("カード(") else name
+
+    for e in events:
+        attacker, victim = (p2_char, p1_char) if e.target == "p1" else (p1_char, p2_char)
+        if e.opp_act is not None and act_category(e.opp_act) == "spell":
+            e.opp_move = spell_name(attacker, e.opp_act) or e.opp_move
+        # 食らった側が出していたスペルカード（attack_context で技名に使う）
+        for act in {f.get("act") for f in e.prev_inputs}:
+            if act_category(act) == "spell" and spell_name(victim, act):
+                e.own_names[act] = spell_name(victim, act)
 
 
 def damage_breakdown(events: list[DamageEvent]) -> list[tuple[str, list[DamageEvent], list[tuple[str, int, float]]]]:
@@ -553,12 +627,85 @@ def damage_breakdown(events: list[DamageEvent]) -> list[tuple[str, list[DamageEv
     for move, group in sorted(by_move.items(), key=lambda x: (x[0] == "", -sum(e.damage_pct for e in x[1]))):
         by_situation: dict[str, list[float]] = {}
         for e in group:
-            situation = e.what_was_doing() if e.prev_inputs else "不明"
+            situation = e.what_was_doing(detail=True) if e.prev_inputs else "不明"
             by_situation.setdefault(situation, []).append(e.damage_pct)
         rows.append((move, group, sorted(
             ((name, len(d), sum(d)) for name, d in by_situation.items()), key=lambda x: -x[2],
         )))
     return rows
+
+
+# ── 履歴に残す被弾の記録
+# 細かい集計を後から足しても過去の試合に効くよう、集計した結果ではなく被弾1回ごとに、
+# 直前 DAMAGE_WINDOW_SEC 秒の両者のアクションの並びごと残す。読み戻すと DamageEvent になるので、
+# 今回の試合と同じ集計（damage_breakdown など）にそのまま掛けられる。
+def _act_runs(inputs: list[dict]) -> list[list]:
+    """フレームの並びを [[アクションID, 続いたフレーム数], ...] に縮める。
+
+    攻撃判定の有無が入っている記録では [アクションID, フレーム数, 攻撃判定が出ているか(0/1)]。
+    """
+    runs: list[list] = []
+    for f in inputs:
+        key = [f.get("act")] if "atk" not in f else [f.get("act"), int(f["atk"] > 0)]
+        if runs and runs[-1][:1] + runs[-1][2:] == key:
+            runs[-1][1] += 1
+        else:
+            runs.append([key[0], 1] + key[1:])
+    return runs
+
+
+def _expand_runs(runs: list[list]) -> list[dict]:
+    return [
+        {"act": run[0]} if len(run) == 2 else {"act": run[0], "atk": run[2]}
+        for run in runs for _ in range(run[1])
+    ]
+
+
+def event_to_record(e: DamageEvent, self_side: str) -> Optional[dict]:
+    """履歴に残す形。アクションIDの無い記録（古いライブ記録・動画だけの解析）の被弾は残さない"""
+    if e.estimated or not e.prev_inputs or e.prev_inputs[-1].get("act") is None:
+        return None
+    return {
+        "kind": "taken" if e.target == self_side else "dealt",
+        "t": round(e.time_sec, 2), "hp": round(e.hp_before, 4), "dmg": round(e.damage_pct, 4),
+        "hits": e.hits, "sp": e.spirit_before,
+        "act": e.opp_act, "move": e.opp_move, "hit": e.hit_act, "down": e.after_down,
+        "dist": e.distance, "corner": e.cornered,
+        "v": _act_runs(e.prev_inputs),   # 食らった側
+        "a": _act_runs(e.opp_inputs),    # 当てた側
+        # 食らった側の技名（スキルのコマンド名・スペルカード名。記録の中に出てくるものだけ）
+        "vn": {str(act): name for act, name in e.own_names.items()
+               if any(f.get("act") == act for f in e.prev_inputs)},
+    }
+
+
+def event_from_record(rec: dict) -> DamageEvent:
+    """履歴の記録を DamageEvent に戻す。自分が食らったものは target="p1"、当てたものは "p2" にする"""
+    return DamageEvent(
+        time_sec=rec["t"], hp_before=rec["hp"], hp_after=rec["hp"] - rec["dmg"], damage_pct=rec["dmg"],
+        prev_inputs=_expand_runs(rec["v"]), opp_inputs=_expand_runs(rec.get("a", [])),
+        target="p1" if rec["kind"] == "taken" else "p2",
+        hits=rec.get("hits", 1), spirit_before=rec.get("sp"),
+        opp_act=rec.get("act"), opp_move=rec.get("move", ""), hit_act=rec.get("hit"),
+        after_down=rec.get("down", False), distance=rec.get("dist"), cornered=rec.get("corner", False),
+        own_names={int(act): name for act, name in rec.get("vn", {}).items()},
+    )
+
+
+def match_record(
+    match_num: int, events: list[DamageEvent], viewpoint: int,
+    p1_char: Optional[str], p2_char: Optional[str], p1_won: Optional[bool],
+) -> dict:
+    """履歴に残す1試合ぶん（自分から見た形にそろえる）"""
+    self_side = "p1" if viewpoint == 1 else "p2"
+    records = [event_to_record(e, self_side) for e in events]
+    return {
+        "match": match_num,
+        "self_char": p1_char if viewpoint == 1 else p2_char,
+        "opp_char": p2_char if viewpoint == 1 else p1_char,
+        "won": _self_won_from_p1_result(p1_won, viewpoint),
+        "events": [r for r in records if r],
+    }
 
 
 def main_matchup(matches: list["MatchData"]) -> tuple[list["MatchData"], str]:
@@ -671,6 +818,20 @@ def analyze_damage_patterns(
     if top_actions:
         desc = "、".join(f"「{a}」({c}回)" for a, c in top_actions)
         results.append(f"  ダメージを受けた直前の行動: {desc}")
+
+    # 自分の攻撃が絡んだ被弾を、技ごとに（ライブ記録のみ）
+    by_context: dict[str, dict[str, list[float]]] = {}
+    for e in my_events:
+        context = e.attack_context() if e.prev_inputs and not e.estimated else None
+        if context:
+            kind, act = context
+            name = _act_name(act, e.own_names.get(act))
+            by_context.setdefault(kind, {}).setdefault(name, []).append(e.damage_pct)
+    for kind, label in ATTACK_CONTEXT_LINES:
+        moves = sorted(by_context.get(kind, {}).items(), key=lambda x: -sum(x[1]))[:3]
+        if moves:
+            results.append(f"  {label}: " + "、".join(
+                f"{name} {len(d)}回・{sum(d)*100:.0f}%" for name, d in moves))
 
     # 相手の始動技ごとの被ダメージ（ライブ記録のみ）
     starters = _starter_summary(my_events)
@@ -812,6 +973,27 @@ IDLE_LABELS = {
 
 
 ACT_CARD_USE = range(690, 700)   # スキルカード・システムカードを使った時（霊撃札は 695 など）
+ACT_STANDING = range(0, 11)      # 立ち・しゃがみ・歩き・ジャンプ・着地（技を出していない状態）
+# DamageEvent.attack_context の種類 → 技名の後ろに付ける言い方
+ATTACK_CONTEXT_LABELS = {
+    "blocked": "をガードされた後",
+    "hit": "を当てた後",
+    "startup": "の出がかり（判定が出る前）",
+    "clash": "の打ち合い負け（判定が出ている最中）",
+    "whiff": "の空振り後（硬直中）",
+    "first": "を出した後（相手が後出し）",
+    "late": "の出がかり（相手が先出し）",
+}
+# アドバイスに出す順と見出し
+ATTACK_CONTEXT_LINES = [
+    ("blocked", "ガードされた後に食らった技"),
+    ("whiff", "空振りの硬直に食らった技"),
+    ("clash", "打ち合いで負けた技"),
+    ("startup", "出がかりを潰された技"),
+    ("first", "先に出して、後出しの技に負けた技"),
+    ("late", "相手が先に出していた技に負けた技"),
+    ("hit", "当てた後に食らった技"),
+]
 
 
 def guard_kind(act: Optional[int]) -> Optional[str]:
@@ -2012,27 +2194,39 @@ def _build_breakdown_table(events: list[DamageEvent], move_head: str, state_head
 
 def _build_breakdown_section(
     events: list[DamageEvent], self_side: str, self_name: str, opp_name: str, scope: str = "",
+    career: bool = False,
 ) -> str:
-    """相手の始動技ごとに、食らった時に自分がしていたことの内訳（と、その逆）。名前はエスケープ済み"""
+    """相手の始動技ごとに、食らった時に自分がしていたことの内訳（と、その逆）。名前はエスケープ済み。
+
+    career は履歴に貯めた試合の通算を出す時。相手は試合ごとに違うので、相手の名前は出さない。
+    """
     if not any(e.opp_move for e in events):
         return ""
     taken = [e for e in events if e.target == self_side]
     dealt = [e for e in events if e.target != self_side]
-    scope_label = f"（{html.escape(scope)}の合計）" if scope else ""
+    if career:
+        heading = f"📚 通算の被弾の内訳（{html.escape(scope)}）"
+        opp_head = "その時の相手"
+        note = "このプレイヤー名で履歴に貯めた試合の合計です（今回の試合を含みます）。"
+    else:
+        heading = "🎯 被弾の内訳（どの技を、何をしている時に食らったか）"
+        heading += f"（{html.escape(scope)}の合計）" if scope else ""
+        opp_head = f"その時の相手（{opp_name}）"
+        note = "回数が少ないうちは偶然の偏りが大きいので、連戦の合計や通算で見るのがおすすめです。"
     return f"""
 <div class="card" style="margin-top:16px">
-<h2>🎯 被弾の内訳（どの技を、何をしている時に食らったか）{scope_label}</h2>
+<h2>{heading}</h2>
 <div class="match-section" style="border-top:none;padding-top:0">
 <h3>{self_name} が食らった技</h3>
 {_build_breakdown_table(taken, "相手の始動技", "その時の自分")}
 </div>
 <div class="match-section">
 <h3>{self_name} が当てた技</h3>
-{_build_breakdown_table(dealt, "自分の始動技", f"その時の相手（{opp_name}）")}
+{_build_breakdown_table(dealt, "自分の始動技", opp_head)}
 </div>
 <div style="color:#888;font-size:.75rem">コンボは1回として、最初に当たった技で数えています。
 射撃は出した後に当たるので、後から出した別の技として数えることがあります。
-回数が少ないうちは偶然の偏りが大きいので、連戦の合計で見るのがおすすめです。</div>
+{note}</div>
 </div>"""
 
 
@@ -2503,6 +2697,8 @@ def build_html(
     breakdown_events: Optional[list[DamageEvent]] = None,
     breakdown_scope: str = "",
     title: Optional[str] = None,
+    career_events: Optional[list[DamageEvent]] = None,
+    career_scope: str = "",
 ) -> str:
     """video_src（レポートから見た動画の場所）があれば動画を埋め込み、to_video で
     再生位置が分かる時刻をクリックで飛べるようにする。"""
@@ -2569,6 +2765,10 @@ def build_html(
     # ── 被弾の内訳 → カード → 入力セクション
     input_section = _build_breakdown_section(
         breakdown_events or [], "p1" if viewpoint == 1 else "p2", self_name, opp_name, breakdown_scope,
+    )
+    # 通算は event_from_record で自分を p1 にそろえてある
+    input_section += _build_breakdown_section(
+        career_events or [], "p1", self_name, opp_name, career_scope, career=True,
     )
     input_section += _build_card_section(card_summaries or [], p1_name, p2_name, viewpoint)
     for rs, color in ((rep, "p1-color"), (rep_opp, "p2-color")):
@@ -2921,8 +3121,12 @@ def analyze(
 
     # ── 履歴への保存 / 傾向コンテキストの取得
     history_context: Optional[dict] = None
+    career_events: list[DamageEvent] = []
+    career_scope = ""
     if use_history:
-        from player_history import save_session, build_trend_context
+        from player_history import (
+            save_session, build_trend_context, save_match_records, load_match_records,
+        )
         _hist_name = player_name or self_name
 
         # 今回のセッションのラウンド勝敗集計
@@ -2964,6 +3168,35 @@ def analyze(
             avg_damage_pct=_avg_dmg,
             notable_advice=_notable,
         )
+
+        # 被弾の記録を試合ごとに貯め、同じキャラの組み合わせの通算を出す（ライブ記録のみ）
+        if live_frames:
+            if len(matches) > 1:
+                group, _ = main_matchup(matches)
+                records = [
+                    match_record(m.match_num, m.damage_events, viewpoint, m.p1_char, m.p2_char, m.p1_won)
+                    for m in matches
+                ]
+                main_chars, current = (group[0].p1_char, group[0].p2_char), len(group)
+            else:
+                records = [match_record(
+                    1, damage_events, viewpoint, p1_char, p2_char, match_winner_from_rounds(rounds),
+                )]
+                main_chars, current = (p1_char, p2_char), 1
+            total = save_match_records(_hist_name, str((live_path or video_path).resolve()), records)
+            print(f"  [履歴] 被弾の記録を保存（累計 {total} 試合）")
+            c_self, c_opp = main_chars if viewpoint == 1 else main_chars[::-1]
+            if c_self and c_opp:
+                past = [
+                    r for r in load_match_records(_hist_name)
+                    if (r.get("self_char"), r.get("opp_char")) == (c_self, c_opp)
+                ]
+                # 今回の試合しか無ければ、上の表と同じになるので出さない
+                if len(past) > current:
+                    career_events = [event_from_record(ev) for r in past for ev in r.get("events", [])]
+                    career_scope = (f"{char_display_name(c_self)} で 対{char_display_name(c_opp)}・"
+                                    f"通算{len(past)}試合")
+                    print(f"  [履歴] {career_scope} を集計")
 
         if use_ai:
             history_context = build_trend_context(_hist_name)
@@ -3037,6 +3270,8 @@ def analyze(
         breakdown_events=breakdown_events if live_frames else None,
         breakdown_scope=breakdown_scope,
         title=report_title,
+        career_events=career_events,
+        career_scope=career_scope,
         # 試合ごとにキャラが違う時は、見出しには出さず各試合の欄に出す
         char_label=(
             f"{char_display_name(p1_char)} vs {char_display_name(p2_char)}"

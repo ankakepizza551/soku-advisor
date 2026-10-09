@@ -54,6 +54,7 @@ CF_MAX_HEALTH        = 0x182  # short: 最大HP (= 10000)
 CF_CURRENT_SPIRIT    = 0x49E  # short: 霊力
 CF_ACTION_ID         = 0x13C  # short: 現在のアクションID
 CF_FRAME_COUNT       = 0x144  # int: アクション経過フレーム数
+CF_ATTACK_BOX_COUNT  = 0x1CB  # ubyte: そのフレームに出ている攻撃判定の数（本体のみ。弾は含まない）
 # 位置と向き（実機で確認: 開幕は P1 が x=480・向き 1、P2 が x=800・向き -1。地上は y=0）
 CF_POS_X             = 0xEC   # float: 横位置
 CF_POS_Y             = 0xF0   # float: 高さ
@@ -400,6 +401,7 @@ class CharState:
     pos_x: float = 0.0
     pos_y: float = 0.0
     facing: int = 0  # 1=右向き, -1=左向き
+    attack_boxes: int = 0  # 出ている攻撃判定の数
 
 
 def read_char_state(proc, char_ptr: int) -> Optional[CharState]:
@@ -433,6 +435,7 @@ def read_char_state(proc, char_ptr: int) -> Optional[CharState]:
         pos_x    = read_float(proc, char_ptr + CF_POS_X) or 0.0,
         pos_y    = read_float(proc, char_ptr + CF_POS_Y) or 0.0,
         facing   = -1 if (read_ubyte(proc, char_ptr + CF_DIRECTION) or 0) > 127 else 1,
+        attack_boxes = read_ubyte(proc, char_ptr + CF_ATTACK_BOX_COUNT) or 0,
     )
 
 
@@ -464,6 +467,7 @@ def encode_input(cs: CharState) -> dict:
         "px": round(cs.pos_x),
         "py": round(cs.pos_y),
         "face": cs.facing,
+        "atk": cs.attack_boxes,
     }
 
 
@@ -615,7 +619,8 @@ class LiveRecorder:
             # 3: p1/p2 に x, y（方向の押下フレーム数）、meta に matches（キャラ）を追加
             # 4: p1/p2 に px, py（位置）、face（向き）を追加
             # 5: p1/p2 に hand（手札）、meta.matches に p1_deck, p2_deck（デッキ）を追加
-            "version": 5,
+            # 6: p1/p2 に atk（出ている攻撃判定の数）を追加
+            "version": 6,
             "recorded_at": datetime.now().isoformat(),
             "total_frames": self.frame_count,
             "match_count": self.match_id,

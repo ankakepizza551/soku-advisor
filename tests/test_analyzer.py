@@ -206,9 +206,82 @@ class DamageTests(unittest.TestCase):
     def test_situation_names_the_movement_or_idle_state(self):
         labels = {200: "前ダッシュ中", 201: "バックステップ中", 214: "飛翔中", 209: "ハイジャンプ中",
                   230: "ダッシュ・飛翔中", 0: "立ち", 2: "しゃがみ", 5: "後ろ歩き中", 7: "ジャンプ中",
-                  695: "カード使用中", 400: "射撃中"}
+                  695: "カード使用中"}
         for act, label in labels.items():
             self.assertEqual(self._hit(act).what_was_doing(), label, act)
+
+    def _exchange(self, mine, theirs, names=None):
+        """直前の両者のアクションの並び（[アクションID, フレーム数] の列）から作った被弾"""
+        event = an.event_from_record({
+            "kind": "taken", "t": 1.0, "hp": 1.0, "dmg": 0.1, "act": 306, "move": "JA",
+            "v": mine, "a": theirs, "vn": names or {},
+        })
+        return event
+
+    def test_attack_context_tells_blocked_whiffed_and_stuffed_apart(self):
+        cases = [
+            # 自分の DA(305) を相手がガード(152) → 硬直中に相手の技が始まり、立った所に食らう
+            ([[0, 30], [305, 30], [0, 10]], [[0, 40], [152, 15], [306, 15]], "DAをガードされた後", "blocked"),
+            # 連係の途中でガードされていれば、最後の技の名前で出す
+            ([[300, 20], [320, 20]], [[150, 30], [306, 10]], "AAをガードされた後", "blocked"),
+            # 当てた後（相手がやられ状態 71）に食らう
+            ([[0, 30], [306, 20]], [[0, 35], [71, 10], [306, 5]], "JAを当てた後", "hit"),
+            # 自分が先に出し、相手の技は後から始まった
+            ([[0, 30], [301, 30]], [[0, 45], [306, 15]], "遠Aを出した後（相手が後出し）", "first"),
+            # 相手の技が先に出ていた
+            ([[0, 50], [306, 10]], [[0, 30], [309, 30]], "JAの出がかり（相手が先出し）", "late"),
+        ]
+        for mine, theirs, label, kind in cases:
+            event = self._exchange(mine, theirs)
+            self.assertEqual(event.what_was_doing(detail=True), label)
+            self.assertEqual(event.attack_context()[0], kind)
+        # 細かくしない時は技名ではなく種類で出す
+        self.assertEqual(self._exchange(*cases[0][:2]).what_was_doing(), "打撃をガードされた後")
+        # スキルは記録で決めたコマンド名で出す
+        skill = self._exchange([[0, 30], [500, 30]], [[0, 40], [152, 10], [306, 10]], names={"500": "236B"})
+        self.assertEqual(skill.what_was_doing(detail=True), "236Bをガードされた後")
+
+    def test_attack_context_does_not_reach_past_other_actions(self):
+        # ガードされた後にハイジャンプしていれば、ハイジャンプ中の被弾
+        jumped = self._exchange([[305, 30], [208, 10]], [[152, 30], [306, 10]])
+        self.assertEqual((jumped.attack_context(), jumped.what_was_doing()), (None, "ハイジャンプ中"))
+        # 硬直が解けてから始まった技を食らったのは、立っていた時の被弾
+        late = self._exchange([[305, 30], [0, 40]], [[152, 30], [0, 30], [306, 10]])
+        self.assertEqual((late.attack_context(), late.what_was_doing()), (None, "立ち"))
+        # 空振りして立っているだけなら、技のせいにはしない
+        idle = self._exchange([[305, 30], [0, 10]], [[0, 25], [306, 15]])
+        self.assertEqual(idle.attack_context(), None)
+
+    def test_attack_boxes_tell_startup_clash_and_whiff_apart(self):
+        theirs = [[0, 30, 0], [309, 30, 0]]
+        cases = [
+            ([[0, 50, 0], [306, 10, 0]], "JAの出がかり（判定が出る前）", "startup"),
+            ([[0, 40, 0], [306, 11, 0], [306, 9, 1]], "JAの打ち合い負け（判定が出ている最中）", "clash"),
+            ([[0, 30, 0], [306, 11, 0], [306, 9, 1], [306, 10, 0]], "JAの空振り後（硬直中）", "whiff"),
+        ]
+        for mine, label, kind in cases:
+            event = self._exchange(mine, theirs)
+            self.assertEqual((event.what_was_doing(detail=True), event.attack_context()[0]), (label, kind))
+        # 弾を撃つ技は本体に判定が出ないので、始まった順で分ける
+        bullet = self._exchange([[0, 50, 0], [400, 10, 0]], theirs)
+        self.assertEqual(bullet.attack_context()[0], "late")
+        # 判定の有無は、履歴に残す形にしても保たれる
+        frames = an._expand_runs(cases[2][0])
+        self.assertEqual(an._act_runs(frames), cases[2][0])
+        self.assertEqual(an._act_runs([{"act": 5}, {"act": 5}]), [[5, 2]])
+
+    def test_summary_lists_own_moves_that_led_to_damage(self):
+        events = [
+            self._exchange([[0, 30], [305, 30], [0, 10]], [[0, 40], [152, 15], [306, 15]]),
+            self._exchange([[0, 30], [305, 30], [0, 10]], [[0, 40], [152, 15], [306, 15]]),
+            self._exchange([[0, 50], [306, 10]], [[0, 30], [309, 30]]),
+        ]
+        lines = an.analyze_damage_patterns(events, "p1", "P1")
+        self.assertIn("  ガードされた後に食らった技: DA 2回・20%", lines)
+        self.assertIn("  相手が先に出していた技に負けた技: JA 1回・10%", lines)
+        boxed = self._exchange([[0, 30, 0], [301, 14, 0], [301, 10, 1], [301, 6, 0]], [[0, 45, 0], [306, 15, 0]])
+        self.assertIn("  空振りの硬直に食らった技: 遠A 1回・10%",
+                      an.analyze_damage_patterns([boxed], "p1", "P1"))
 
     def test_chip_damage_and_crush_are_told_apart_from_a_plain_guard(self):
         self.assertEqual(self._hit(150, at_hit=150).what_was_doing(), "ガード中（削り）")
@@ -232,7 +305,7 @@ class DamageTests(unittest.TestCase):
         rows = an.damage_breakdown(events)
         self.assertEqual([(move, len(group)) for move, group, _ in rows], [("JA", 3), ("6C", 1), ("", 1)])
         self.assertEqual([(name, n, round(total, 2)) for name, n, total in rows[0][2]],
-                         [("前ダッシュ中", 2, 0.2), ("打撃中", 1, 0.1)])
+                         [("前ダッシュ中", 2, 0.2), ("近Aを出した後（相手が後出し）", 1, 0.1)])
 
     def test_time_format(self):
         self.assertEqual(an._fmt_time(46.94), "46.9秒")
@@ -592,6 +665,52 @@ class AnalyzeTests(unittest.TestCase):
 
     def _two_matches(self):
         return make_round(0, 0.0, match=1) + make_round(2000, 100.0, match=2)
+
+    def _hit_frames(self, own_act):
+        """P1 が own_act の直後に相手の JA(306) で食らい、そのまま負ける 1 ラウンド"""
+        frames = make_round(0, 0.0, loser="p1")
+        for f in frames[:200]:
+            f["p2"]["act"] = 306
+            f["p1"]["act"] = own_act if f["f"] < 1 else 71
+        return frames
+
+    def test_event_record_round_trips_through_history(self):
+        event = an.detect_damage_events(self._hit_frames(200))[0]
+        rec = json.loads(json.dumps(an.event_to_record(event, "p1")))
+        back = an.event_from_record(rec)
+        self.assertEqual((back.target, back.opp_move, back.what_was_doing()), ("p1", "JA", "前ダッシュ中"))
+        self.assertAlmostEqual(back.damage_pct, event.damage_pct, places=3)
+        self.assertEqual(rec["a"], [[306, 1]])
+        self.assertEqual(an.event_from_record(an.event_to_record(event, "p2")).target, "p2")
+        # アクションIDの無い記録は残さない
+        event.prev_inputs = [{"a": 1}]
+        self.assertIsNone(an.event_to_record(event, "p1"))
+
+    def test_career_table_sums_matches_against_the_same_character(self):
+        chars = [{"match": 1, "p1_char": "aya", "p2_char": "yuyuko"}]
+        out = self.tmp / "career.html"
+        first = self._write("day1.json", self._hit_frames(200), chars)
+        an.analyze(None, None, out, first, player_name="tester", use_history=True)
+        self.assertNotIn("通算の被弾の内訳", out.read_text(encoding="utf-8"))   # 1試合目は今回の表と同じ
+        second = self._write("day2.json", self._hit_frames(214), chars)
+        an.analyze(None, None, out, second, player_name="tester", use_history=True)
+        report = out.read_text(encoding="utf-8")
+        self.assertIn("📚 通算の被弾の内訳（射命丸文 で 対西行寺幽々子・通算2試合）", report)
+        career = report[report.index("📚 通算"):report.index("🃏") if "🃏" in report else None]
+        self.assertIn("<td>JA</td><td style=\"text-align:center\">2回</td>", career)
+        self.assertIn("前ダッシュ中 1回", career)
+        self.assertIn("飛翔中 1回", career)
+        # 同じファイルを解析し直しても増えない。相手キャラが違う試合は通算に入らない
+        an.analyze(None, None, out, second, player_name="tester", use_history=True)
+        self.assertEqual(len(ph.load_match_records("tester")), 2)
+        other = self._write("day3.json", self._hit_frames(200),
+                            [{"match": 1, "p1_char": "aya", "p2_char": "reimu"}])
+        an.analyze(None, None, out, other, player_name="tester", use_history=True)
+        self.assertNotIn("通算の被弾の内訳", out.read_text(encoding="utf-8"))
+        self.assertEqual([m["opp_char"] for m in ph.load_match_records("tester")],
+                         ["yuyuko", "yuyuko", "reimu"])
+        ph.clear_history("tester")
+        self.assertEqual(ph.load_match_records("tester"), [])
 
     def _named(self, name="2027_じぶん(aya) vs あいて(yuyuko).json"):
         return self._write(name, make_round(0, 0.0), [{"match": 1, "p1_char": "aya", "p2_char": "yuyuko"}])

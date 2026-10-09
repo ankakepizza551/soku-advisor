@@ -5,6 +5,7 @@ player_history.py — プレイヤー履歴の蓄積・傾向分析
 AI コーチングの文脈として傾向サマリーを提供する。
 
 保存先: ~/Videos/.soku_advisor_history/<player_name>.json
+        ~/Videos/.soku_advisor_history/<player_name>.events.json（試合ごとの被弾の記録）
 """
 
 from __future__ import annotations
@@ -17,12 +18,51 @@ from typing import Optional
 
 HISTORY_DIR = Path.home() / "Videos" / ".soku_advisor_history"
 MAX_SESSIONS = 50
+MAX_MATCHES = 300   # 被弾の記録を残す試合数（1試合 10KB 前後）
+
+
+def _safe_name(player_name: str) -> str:
+    return "".join(c for c in player_name if c.isalnum() or c in " _-")[:40].strip() or "unknown"
 
 
 def _history_path(player_name: str) -> Path:
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-    safe = "".join(c for c in player_name if c.isalnum() or c in " _-")[:40].strip() or "unknown"
-    return HISTORY_DIR / f"{safe}.json"
+    return HISTORY_DIR / f"{_safe_name(player_name)}.json"
+
+
+def _events_path(player_name: str) -> Path:
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    return HISTORY_DIR / f"{_safe_name(player_name)}.events.json"
+
+
+def load_match_records(player_name: str) -> list[dict]:
+    """貯めてある試合ごとの被弾の記録（古い順）。無い・壊れている時は空"""
+    path = _events_path(player_name)
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("matches", [])
+    except Exception:
+        return []
+
+
+def save_match_records(player_name: str, source: str, records: list[dict]) -> int:
+    """1回の解析ぶんの試合の記録を足して保存し、貯まっている試合数を返す。
+
+    セッションの履歴と同じく、同じファイルから解析し直した時は前の分を置き換える。
+    細かい集計を後から足しても過去の試合に効くよう、集計した結果ではなく
+    被弾1回ごとの記録をそのまま残す（中身は analyzer.event_to_record）。
+    """
+    date = datetime.now().isoformat(timespec="seconds")
+    matches = [m for m in load_match_records(player_name) if m.get("source") != source]
+    matches += [{"date": date, "source": source, **rec} for rec in records]
+    matches = matches[-MAX_MATCHES:]
+    _events_path(player_name).write_text(
+        json.dumps({"version": 1, "player_name": player_name, "matches": matches},
+                   ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return len(matches)
 
 
 def load_history(player_name: str) -> dict:
@@ -191,6 +231,6 @@ def get_session_count(player_name: str) -> int:
 
 
 def clear_history(player_name: str) -> None:
-    path = _history_path(player_name)
-    if path.exists():
-        path.unlink()
+    for path in (_history_path(player_name), _events_path(player_name)):
+        if path.exists():
+            path.unlink()
