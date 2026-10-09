@@ -270,6 +270,38 @@ class DamageTests(unittest.TestCase):
         self.assertEqual(an._act_runs(frames), cases[2][0])
         self.assertEqual(an._act_runs([{"act": 5}, {"act": 5}]), [[5, 2]])
 
+    def test_overview_only_states_what_happened_often_enough(self):
+        dash = [[0, 50], [200, 10]]
+        stuffed = self._exchange([[0, 50], [306, 10]], [[0, 30], [309, 30]])
+        events = [self._exchange(dash, [[0, 45], [306, 15]]) for _ in range(3)] + [stuffed, stuffed]
+        for e in events[3:]:
+            e.opp_move = "J8A"
+        dealt = self._exchange([[0, 60]], [[0, 45], [306, 15]])
+        dealt.target, dealt.opp_move = "p2", "6A"
+        lines = an.overview_lines(events + [dealt], "p1")
+        self.assertEqual(lines, [
+            "一番ダメージを取られたのは相手の JA 始動です（3回・合計30%）。そのうち3回は「前ダッシュ中」の時でした。",
+            "被弾5回のうち3回は「前ダッシュ中」の時です（合計30%）。",
+            "自分の技では、JAの出がかり（相手が先出し）の被弾が目立ちます（2回・合計20%）。",
+        ])
+        # 回数が足りなければ言い切らない
+        few = an.overview_lines(events[:1] + [dealt], "p1")
+        self.assertEqual(len(few), 1)
+        self.assertIn("はっきりした傾向は出ていません（被弾1回）", few[0])
+        self.assertEqual(an.overview_lines([], "p1"), [])
+        # 通算は別の行で足す
+        career = an.overview_lines(events[:1], "p1", career_events=events, career_scope="文 で 対幽々子・通算5試合")
+        self.assertIn("通算（文 で 対幽々子・通算5試合）では、相手の JA 始動に一番取られています（3回・合計30%）。", career)
+
+    def test_overview_mentions_wrong_guards(self):
+        stats = an.LiveStats()
+        stats.guard_counts = {"right": 10, "wrong_low": 4, "wrong_high": 1, "crush": 2}
+        stats.wrong_guard_moves["wrong_low"].update({"DA": 3, "6A": 1})
+        lines = an.overview_lines([self._exchange([[0, 60]], [[0, 45], [306, 15]])], "p1", stats)
+        self.assertIn("しゃがみガードで中段を4回受けています（多いのは DA 3回、6A 1回）。", lines)
+        self.assertIn("ガードクラッシュが2回あります。", lines)
+        self.assertFalse(any("立ちガード" in ln for ln in lines))
+
     def test_summary_lists_own_moves_that_led_to_damage(self):
         events = [
             self._exchange([[0, 30], [305, 30], [0, 10]], [[0, 40], [152, 15], [306, 15]]),
@@ -535,6 +567,7 @@ class CardTests(unittest.TestCase):
         an.analyze(None, None, out, live)
         report = out.read_text(encoding="utf-8")
         self.assertIn("🎯 被弾の内訳", report)
+        self.assertIn("📝 総評", report)
         self.assertIn("<td>神霊「夢想封印」</td><td style=\"text-align:center\">1回</td>", report)
         self.assertIn("前ダッシュ中 1回", report)
 
@@ -711,6 +744,105 @@ class AnalyzeTests(unittest.TestCase):
                          ["yuyuko", "yuyuko", "reimu"])
         ph.clear_history("tester")
         self.assertEqual(ph.load_match_records("tester"), [])
+
+    def _two_files(self):
+        """1試合ずつ入ったライブ記録 2 つ（P1 が勝つ試合と負ける試合）"""
+        chars = [{"match": 1, "p1_char": "aya", "p2_char": "yuyuko"}]
+        a = self._write("day_a.json", make_round(0, 0.0, loser="p2"), chars)
+        b = self._write("day_b.json", make_round(0, 0.0, loser="p1"), chars)
+        for path, stamp in ((a, "2026-10-01T10:00:00"), (b, "2026-10-01T10:05:00")):
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw["meta"]["recorded_at"] = stamp
+            path.write_text(json.dumps(raw), encoding="utf-8")
+        return a, b
+
+    def _fake_video_hp(self, frames):
+        """その試合を頭から写した動画の HP（動画の時刻は 0 から）"""
+        t0 = frames[0]["t"]
+        return [(f["t"] - t0, f["p1"]["hp"] / 10000, f["p2"]["hp"] / 10000) for f in frames[::6]]
+
+    def test_several_live_files_become_one_session(self):
+        a, b = self._two_files()
+        hp, p1, p2, frames, meta, match_file, metas = an.load_live_files([a, b])
+        self.assertEqual([m["match"] for m in meta["matches"]], [1, 2])
+        self.assertEqual(match_file, {1: 0, 2: 1})
+        self.assertEqual(sorted({f["match"] for f in frames}), [1, 2])
+        times = [f["t"] for f in frames]
+        self.assertEqual(times, sorted(times))
+        self.assertGreater(frames[960]["t"] - frames[959]["t"], an.MATCH_GAP_SEC)
+        self.assertEqual([m["recorded_at"] for m in metas], ["2026-10-01T10:00:00", "2026-10-01T10:05:00"])
+        # 1つだけの時は中身をそのまま返す
+        self.assertEqual(an.load_live_files([a])[3], json.loads(a.read_text(encoding="utf-8"))["frames"])
+        out = self.tmp / "session.html"
+        an.analyze(None, None, out, [a, b])
+        report = out.read_text(encoding="utf-8")
+        self.assertIn("2試合", report)
+        self.assertIn("試合 2", report)
+
+    def test_videos_are_matched_to_matches_by_name_then_by_hp(self):
+        a, b = self._two_files()
+        frames_a = json.loads(a.read_text(encoding="utf-8"))["frames"]
+        frames_b = json.loads(b.read_text(encoding="utf-8"))["frames"]
+        hps = {"day_a": self._fake_video_hp(frames_a), "day_b": self._fake_video_hp(frames_b)}
+        real = an.read_video_hp
+        an.read_video_hp = lambda path: hps[path.stem if path.stem in hps else {"x": "day_b", "y": "day_a"}[path.stem]]
+        try:
+            # 同じ名前の .mp4 が隣にあれば、指定しなくても使う
+            for stem in ("day_a", "day_b"):
+                (self.tmp / f"{stem}.mp4").write_bytes(b"")
+            out = self.tmp / "paired.html"
+            an.analyze(None, None, out, [a, b])
+            report = out.read_text(encoding="utf-8")
+            self.assertIn('const VIDEO_SRCS = ["day_a.mp4", "day_b.mp4"];', report)
+            self.assertIn('const VIDEO_LABELS = ["試合1", "試合2"];', report)
+            self.assertIn('data-v="1"', report)
+            # 名前が違う動画は HP の減り方で決める（渡した順が逆でも、試合の順に並ぶ）
+            for stem in ("day_a", "day_b"):
+                (self.tmp / f"{stem}.mp4").unlink()
+            x, y = self.tmp / "x.mp4", self.tmp / "y.mp4"
+            x.write_bytes(b""); y.write_bytes(b"")
+            an.analyze([x, y], None, out, [a, b])
+            report = out.read_text(encoding="utf-8")
+            self.assertIn('const VIDEO_SRCS = ["y.mp4", "x.mp4"];', report)
+        finally:
+            an.read_video_hp = real
+        with self.assertRaises(an.AnalyzeError):
+            an.analyze([x, y], None, out, None)
+
+    def test_collect_copies_the_inputs_next_to_the_report(self):
+        a, b = self._two_files()
+        rep = self.tmp / "day_a.rep"
+        make_rep(rep, 3, [0x10, 0x80] * 10)
+        out = an.analyze(None, rep, self.tmp / "day_a.html", [a, b], collect=True)
+        folder = self.tmp / ("day_a" + an.COLLECT_SUFFIX)
+        self.assertEqual(out, folder / "day_a.html")
+        self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                         ["day_a.html", "day_a.json", "day_a.rep", "day_b.json"])
+        self.assertTrue(a.exists() and b.exists() and rep.exists())      # 元は動かさない
+        # 作り直してもコピーは増えない。同じ名前で中身が違うファイルは上書きしない
+        an.analyze(None, rep, self.tmp / "day_a.html", [a, b], collect=True)
+        self.assertEqual(len(list(folder.iterdir())), 4)
+        other = self.tmp / "sub"; other.mkdir()
+        (other / "day_a.json").write_text("{}", encoding="utf-8")
+        copied = an.collect_files(folder, [other / "day_a.json"])
+        self.assertEqual(copied[0].name, "day_a (2).json")
+
+    def test_history_is_keyed_by_recording_time_not_by_location(self):
+        a, _ = self._two_files()
+        out = self.tmp / "h.html"
+        an.analyze(None, None, out, a, player_name="tester", use_history=True)
+        moved = self.tmp / "moved"; moved.mkdir()
+        copy = moved / "renamed.json"
+        copy.write_bytes(a.read_bytes())
+        an.analyze(None, None, out, copy, player_name="tester", use_history=True)
+        self.assertEqual(len(ph.load_match_records("tester")), 1)
+        self.assertEqual(len(ph.load_history("tester")["sessions"]), 1)
+        # 前の版が場所で付けたキーの分も、同じ対戦なら置き換える
+        ph.save_match_records("tester", str(a.resolve()), [{"match": 1, "events": []}])
+        self.assertEqual(len(ph.load_match_records("tester")), 2)
+        an.analyze(None, None, out, a, player_name="tester", use_history=True)
+        self.assertEqual(len(ph.load_match_records("tester")), 1)
+        ph.clear_history("tester")
 
     def _named(self, name="2027_じぶん(aya) vs あいて(yuyuko).json"):
         return self._write(name, make_round(0, 0.0), [{"match": 1, "p1_char": "aya", "p2_char": "yuyuko"}])

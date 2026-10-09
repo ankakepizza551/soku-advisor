@@ -60,6 +60,9 @@ from soku_live_reader import (
     is_current_process_admin, restart_current_process_as_admin,
 )
 from analyzer import analyze, AnalyzeError
+
+# 動画・ライブ記録の欄に複数のファイルを入れる時の区切り（| はファイル名に使えない文字）
+PATH_SEP = " | "
 from char_advisor import char_id_choices, parse_char_choice
 from ai_advisor import ai_available
 
@@ -435,6 +438,12 @@ class SokuAdvisorApp(tk.Tk):
             variable=self._hide_opp_var,
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 2))
 
+        self._collect_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            opts, text="使った動画・記録・.rep を1つのフォルダにまとめる（コピー）",
+            variable=self._collect_var,
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(0, 2))
+
         self._use_ai_var = tk.BooleanVar(value=False)
         ai_state = "normal" if ai_available() else "disabled"
         ttk.Checkbutton(
@@ -719,27 +728,27 @@ class SokuAdvisorApp(tk.Tk):
             self._live_path_var.set(p)
 
     def _browse_video(self):
-        p = filedialog.askopenfilename(
-            title="動画ファイルを選択",
+        picked = filedialog.askopenfilenames(
+            title="動画ファイルを選択（試合ごとに分かれている時は複数選べます）",
             filetypes=[("動画", "*.mp4 *.avi *.mkv"), ("すべて", "*.*")],
             initialdir=str(Path.home() / "Videos"),
         )
-        if p:
-            self._video_var.set(p)
+        if picked:
+            self._video_var.set(PATH_SEP.join(picked))
             # .rep を同ディレクトリで自動検索
-            rep = Path(p).with_suffix(".rep")
-            if rep.exists() and not self._rep_var.get():
+            rep = Path(picked[0]).with_suffix(".rep")
+            if len(picked) == 1 and rep.exists() and not self._rep_var.get():
                 self._rep_var.set(str(rep))
                 self._log_msg(f".rep 自動検出: {rep.name}")
 
     def _browse_json(self):
-        p = filedialog.askopenfilename(
-            title="ライブ記録JSONを選択",
+        picked = filedialog.askopenfilenames(
+            title="ライブ記録JSONを選択（複数選ぶと連戦として1つのレポートになります）",
             filetypes=[("JSON", "*.json"), ("すべて", "*.*")],
             initialdir=str(Path.home() / "Videos"),
         )
-        if p:
-            self._json_var.set(p)
+        if picked:
+            self._json_var.set(PATH_SEP.join(sorted(picked)))
 
     def _browse_rep(self):
         p = filedialog.askopenfilename(
@@ -777,15 +786,13 @@ class SokuAdvisorApp(tk.Tk):
                 "動画ファイルまたはライブ記録JSONを指定してください。")
             return
 
-        video_path = Path(video) if video else None
-        live_path  = Path(live)  if live  else None
+        # 動画とライブ記録は複数入っていることがある（PATH_SEP 区切り）
+        video_path = [Path(p.strip()) for p in video.split(PATH_SEP.strip()) if p.strip()]
+        live_path  = [Path(p.strip()) for p in live.split(PATH_SEP.strip()) if p.strip()]
         rep_path   = Path(rep)   if rep   else None
 
-        # 出力先の決定
-        if video_path:
-            out = video_path.with_suffix(".html")
-        else:
-            out = live_path.with_suffix(".html")
+        # 出力先の決定（複数ある時は最初のファイルの名前）
+        out = (video_path or live_path)[0].with_suffix(".html")
 
         self._log_msg("レポート生成中...")
         self._progress.start(12)
@@ -800,13 +807,14 @@ class SokuAdvisorApp(tk.Tk):
         _p2_char = parse_char_choice(self._p2_char_var.get())
         _use_ai = self._use_ai_var.get()
         _hide_opp = self._hide_opp_var.get()
+        _collect = self._collect_var.get()
 
         def run():
             try:
                 # analyzer.py の analyze() を直接呼び出す
                 # （別スレッドから Tk を触らないよう after 経由でログに流す）
                 _redirect_print(lambda m: self._post(self._log_msg, m))
-                analyze(
+                done = analyze(
                     video_path, rep_path, out,
                     live_path, viewpoint=_viewpoint,
                     p1_char=_p1_char,
@@ -815,8 +823,9 @@ class SokuAdvisorApp(tk.Tk):
                     player_name=_pname,
                     use_history=_use_hist,
                     hide_opp_name=_hide_opp,
+                    collect=_collect,
                 )
-                self._post(self._on_report_done, out)
+                self._post(self._on_report_done, done)
             except AnalyzeError as e:
                 self._post(self._on_report_error, str(e))
             except Exception as e:

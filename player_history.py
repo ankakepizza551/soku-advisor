@@ -46,15 +46,18 @@ def load_match_records(player_name: str) -> list[dict]:
         return []
 
 
-def save_match_records(player_name: str, source: str, records: list[dict]) -> int:
+def save_match_records(
+    player_name: str, source: str, records: list[dict], aliases: tuple | list = (),
+) -> int:
     """1回の解析ぶんの試合の記録を足して保存し、貯まっている試合数を返す。
 
-    セッションの履歴と同じく、同じファイルから解析し直した時は前の分を置き換える。
+    セッションの履歴と同じく、同じ対戦から解析し直した時は前の分を置き換える（aliases も同じ意味）。
     細かい集計を後から足しても過去の試合に効くよう、集計した結果ではなく
     被弾1回ごとの記録をそのまま残す（中身は analyzer.event_to_record）。
     """
     date = datetime.now().isoformat(timespec="seconds")
-    matches = [m for m in load_match_records(player_name) if m.get("source") != source]
+    same = {source, *aliases}
+    matches = [m for m in load_match_records(player_name) if m.get("source") not in same]
     matches += [{"date": date, "source": source, **rec} for rec in records]
     matches = matches[-MAX_MATCHES:]
     _events_path(player_name).write_text(
@@ -87,11 +90,13 @@ def save_session(
     avg_damage_pct: float,
     notable_advice: list[str],
     source: Optional[str] = None,
+    aliases: tuple | list = (),
 ) -> None:
     """1セッションの解析結果を履歴に追記・保存する。
 
-    source は解析元ファイルのパス。同じファイルからレポートを作り直した時は
-    前の分を置き換える（同じ対戦を二重に数えない）。
+    source は解析元を見分けるキー（analyzer.history_key）。同じ対戦からレポートを
+    作り直した時は前の分を置き換える（同じ対戦を二重に数えない）。
+    aliases は、前の版が同じ対戦に付けていたキー。それで残っている分も置き換える。
     """
     history = load_history(player_name)
     entry: dict = {
@@ -118,7 +123,8 @@ def save_session(
     sessions: list = history.setdefault("sessions", [])
     if source:
         entry["source"] = source
-        sessions[:] = [s for s in sessions if s.get("source") != source]
+        same = {source, *aliases}
+        sessions[:] = [s for s in sessions if s.get("source") not in same]
     sessions.append(entry)
     if len(sessions) > MAX_SESSIONS:
         sessions[:] = sessions[-MAX_SESSIONS:]

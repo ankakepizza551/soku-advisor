@@ -15,6 +15,7 @@ import argparse
 import html
 import json
 import re
+import shutil
 import struct
 import sys
 import os
@@ -708,6 +709,100 @@ def match_record(
     }
 
 
+# ── 総評
+# レポートの先頭に出す数行。回数の少ない偏りを傾向と言い切らないよう、
+# OVERVIEW_MIN_COUNT 回以上か、合計 OVERVIEW_MIN_DAMAGE 以上のものだけ載せる。
+OVERVIEW_MIN_COUNT = 3
+OVERVIEW_MIN_DAMAGE = 0.20
+
+
+def _notable(damages: list[float]) -> bool:
+    return len(damages) >= OVERVIEW_MIN_COUNT or sum(damages) >= OVERVIEW_MIN_DAMAGE
+
+
+def _count_pct(damages: list[float]) -> str:
+    return f"{len(damages)}回・合計{sum(damages) * 100:.0f}%"
+
+
+def overview_lines(
+    events: list[DamageEvent],
+    self_side: str,
+    self_stats: Optional["LiveStats"] = None,
+    career_events: Optional[list[DamageEvent]] = None,
+    career_scope: str = "",
+) -> list[str]:
+    """総評（ライブ記録のみ）。events は被弾の内訳の表と同じ範囲、career_events は通算（自分が p1）"""
+    taken = [e for e in events if e.target == self_side and e.prev_inputs and not e.estimated]
+    dealt = [e for e in events if e.target != self_side and e.prev_inputs and not e.estimated]
+    if not taken and not dealt:
+        return []
+    lines: list[str] = []
+
+    # 一番ダメージを取られた相手の技と、その時に多かった自分の状況
+    rows = [row for row in damage_breakdown(taken) if row[0]]
+    if rows and _notable([e.damage_pct for e in rows[0][1]]):
+        move, group, situations = rows[0]
+        line = f"一番ダメージを取られたのは相手の {move} 始動です（{_count_pct([e.damage_pct for e in group])}）。"
+        name, n, total = situations[0]
+        if n >= 2:
+            line += f"そのうち{n}回は「{name}」の時でした。"
+        lines.append(line)
+
+    # 相手の技を問わず、食らった時に多かった状況
+    by_situation: dict[str, list[float]] = {}
+    for e in taken:
+        by_situation.setdefault(e.what_was_doing(), []).append(e.damage_pct)
+    if by_situation:
+        name, damages = max(by_situation.items(), key=lambda x: sum(x[1]))
+        if _notable(damages) and len(damages) >= 2:
+            lines.append(f"被弾{len(taken)}回のうち{len(damages)}回は「{name}」の時です（合計{sum(damages) * 100:.0f}%）。")
+
+    # 自分の技で一番負けている形
+    by_loss: dict[tuple[str, str], list[float]] = {}
+    for e in taken:
+        context = e.attack_context()
+        if context:
+            kind, act = context
+            by_loss.setdefault((kind, _act_name(act, e.own_names.get(act))), []).append(e.damage_pct)
+    if by_loss:
+        (kind, name), damages = max(by_loss.items(), key=lambda x: sum(x[1]))
+        if len(damages) >= 2:
+            lines.append(f"自分の技では、{name}{ATTACK_CONTEXT_LABELS[kind]}の被弾が目立ちます（{_count_pct(damages)}）。")
+
+    # ガード
+    if self_stats is not None:
+        g = self_stats.guard_counts
+        for key, label in (("wrong_low", "しゃがみガードで中段"), ("wrong_high", "立ちガードで下段")):
+            if g.get(key, 0) >= OVERVIEW_MIN_COUNT:
+                line = f"{label}を{g[key]}回受けています"
+                top = self_stats.wrong_guard_moves[key].most_common(2)
+                if top:
+                    line += "（多いのは " + "、".join(f"{name} {n}回" for name, n in top) + "）"
+                lines.append(line + "。")
+        if g.get("crush", 0) >= 2:
+            lines.append(f"ガードクラッシュが{g['crush']}回あります。")
+
+    # 通っている技
+    rows = [row for row in damage_breakdown(dealt) if row[0]]
+    if rows and _notable([e.damage_pct for e in rows[0][1]]):
+        move, group, _ = rows[0]
+        lines.append(f"自分の技で一番通っているのは {move} 始動です（{_count_pct([e.damage_pct for e in group])}）。")
+
+    if not lines:
+        lines.append(
+            f"この記録だけでは、はっきりした傾向は出ていません（被弾{len(taken)}回）。"
+            "連戦の記録や通算で見ると、傾向が出やすくなります。"
+        )
+
+    # 通算でも同じ技にやられているか
+    rows = [row for row in damage_breakdown([e for e in career_events or [] if e.target == "p1"]) if row[0]]
+    if rows and _notable([e.damage_pct for e in rows[0][1]]):
+        move, group, _ = rows[0]
+        lines.append(f"通算（{career_scope}）では、相手の {move} 始動に一番取られています"
+                     f"（{_count_pct([e.damage_pct for e in group])}）。")
+    return lines
+
+
 def main_matchup(matches: list["MatchData"]) -> tuple[list["MatchData"], str]:
     """連戦で技を集計する試合と、その範囲の呼び方（「全3試合」など）。
 
@@ -1227,6 +1322,84 @@ def parse_live_json(
     return hp_samples, p1, p2, frames, raw.get("meta", {})
 
 
+def load_live_files(
+    live_paths: list[Path],
+    p1_name: str = "P1",
+    p2_name: str = "P2",
+) -> tuple[list[tuple[float, float, float]], "LiveStats", "LiveStats", list[dict], dict, dict[int, int], list[dict]]:
+    """ライブ記録を1つ以上読み、渡した順につないで1つの連戦にする。
+
+    parse_live_json と同じ5つに加えて、試合番号 → 何番目のファイルから来たか、と、
+    ファイルごとの meta を返す。ファイルをまたいで試合番号が重ならないよう振り直し、
+    時刻は前のファイルの終わりから間を空けて続ける（meta["matches"] も振り直した番号になる）。
+    """
+    frames: list[dict] = []
+    matches_meta: list[dict] = []
+    match_file: dict[int, int] = {}
+    metas: list[dict] = []
+    next_match, t_off, f_off = 1, 0.0, 0
+    for k, path in enumerate(live_paths):
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        meta = raw.get("meta", {})
+        metas.append(meta)
+        own = raw.get("frames", [])
+        ids = sorted({f.get("match", 1) for f in own})
+        renumber = {old: next_match + i for i, old in enumerate(ids)}
+        next_match += len(ids)
+        recorded = {m.get("match"): m for m in meta.get("matches") or []}
+        for old, new in renumber.items():
+            match_file[new] = k
+            if old in recorded:
+                matches_meta.append({**recorded[old], "match": new})
+        if len(live_paths) == 1:
+            # 1つだけの時は中身をそのまま使う（試合番号の無い古い記録もそのまま）
+            frames, matches_meta = own, meta.get("matches") or []
+            match_file = {old: 0 for old in ids}
+            break
+        for f in own:
+            frames.append({**f, "t": round(f["t"] + t_off, 4), "f": f.get("f", 0) + f_off,
+                           "match": renumber[f.get("match", 1)]})
+        if own:
+            t_off = frames[-1]["t"] + MATCH_GAP_SEC * 2
+            f_off = frames[-1]["f"] + 1
+    meta = {**(metas[0] if metas else {}), "matches": matches_meta}
+    p1, p2 = parse_live_stats_from_frames(frames, p1_name, p2_name)
+    return frames_to_hp_samples(frames), p1, p2, frames, meta, match_file, metas
+
+
+COLLECT_SUFFIX = "_レポート一式"   # 使ったファイルをまとめるフォルダの名前（レポートの名前の後ろに付ける）
+
+
+def collect_files(folder: Path, files: list[Path]) -> list[Path]:
+    """files を folder にコピーし、コピー先の場所を同じ並びで返す。元のファイルは動かさない。
+
+    同じ名前・同じ大きさのファイルが既にあればコピーしない（作り直した時に動画を何度もコピーしない）。
+    同じ名前で中身の違うファイルがある時は、上書きせず「名前 (2)」のように別の名前にする。
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    copied: list[Path] = []
+    for src in files:
+        dest = folder / src.name
+        n = 2
+        while dest.exists() and dest.resolve() != src.resolve() and dest.stat().st_size != src.stat().st_size:
+            dest = folder / f"{src.stem} ({n}){src.suffix}"
+            n += 1
+        if not dest.exists():
+            print(f"  コピー中: {src.name}")
+            shutil.copy2(src, dest)
+        copied.append(dest)
+    return copied
+
+
+def history_key(path: Path, meta: Optional[dict] = None) -> str:
+    """履歴の中で同じ対戦かどうかを見分けるキー。
+
+    ライブ記録は記録した日時を使う（ファイルを動かしたりコピーしたりしても変わらない）。
+    日時の入っていない古い記録と動画は、ファイルの場所。
+    """
+    return (meta or {}).get("recorded_at") or str(path.resolve())
+
+
 # ────────────────────────────────────────────
 # 連戦（複数試合）分割
 # ────────────────────────────────────────────
@@ -1247,6 +1420,9 @@ class MatchData:
     p1_won: Optional[bool] = None
     p1_char: Optional[str] = None
     p2_char: Optional[str] = None
+    # 動画を試合ごとに割り当てた時だけ入る（1本の動画が連戦全体を写している時は None のまま）
+    video_index: Optional[int] = None          # レポートに並べた動画の何番目か
+    to_video: Optional[Callable] = None        # 記録の時刻 → その動画の再生位置
 
 
 def frames_to_hp_samples(frames: list[dict]) -> list[tuple[float, float, float]]:
@@ -2136,6 +2312,8 @@ a.seek:hover{{color:#fff}}
 
 {video_section}
 
+{overview_section}
+
 <div class="grid">
 <div class="card">
 <h2>{summary_title}</h2>
@@ -2157,14 +2335,34 @@ a.seek:hover{{color:#fff}}
 
 <script>
 // 動画をその再生位置の少し手前から再生する（動画が無いレポートでは何もしない）
-function seekTo(sec) {{
+// 動画が試合ごとに分かれている時は、which 番目の動画に切り替えてから飛ぶ
+const VIDEO_SRCS = {video_srcs_json};
+const VIDEO_LABELS = {video_labels_json};
+let videoNow = 0;
+function showVideoNow() {{
+  const el = document.getElementById('videoNow');
+  if (el) el.textContent = '（再生中: ' + VIDEO_LABELS[videoNow] + '）';
+}}
+function seekTo(sec, which) {{
   const v = document.getElementById('matchVideo');
   if (!v) return;
-  v.currentTime = Math.max(0, sec - {seek_lead});
+  const start = Math.max(0, sec - {seek_lead});
+  which = which || 0;
+  if (which !== videoNow && which < VIDEO_SRCS.length) {{
+    videoNow = which;
+    // 読み込みが終わってから位置を合わせる。#t= は、読み込み前に再生が始まっても頭に戻らないための保険
+    v.addEventListener('loadedmetadata', () => {{ v.currentTime = start; v.play(); }}, {{once: true}});
+    v.src = VIDEO_SRCS[which] + '#t=' + start.toFixed(1);
+    v.load();
+    showVideoNow();
+    return;
+  }}
+  v.currentTime = start;
   v.play();
 }}
+showVideoNow();
 document.querySelectorAll('a.seek').forEach(a => {{
-  a.addEventListener('click', () => seekTo(parseFloat(a.dataset.t)));
+  a.addEventListener('click', () => seekTo(parseFloat(a.dataset.t), parseInt(a.dataset.v || '0')));
 }});
 {chart_scripts}
 </script>
@@ -2495,12 +2693,60 @@ def _chartjs_tag() -> str:
 ToVideo = Optional[Callable[[float], Optional[float]]]
 
 
+def _sync_score(sync: Optional[LiveVideoSync]) -> float:
+    """時刻合わせの確かさ（合ったラウンドの相関の合計）。合わなければ 0"""
+    if sync is None:
+        return 0.0
+    return sum(score for score, off in zip(sync.scores, sync.offsets) if off is not None)
+
+
+def assign_videos(
+    matches: list["MatchData"],
+    match_stems: list[Optional[str]],
+    video_stems: list[str],
+    video_hps: list[Optional[list]],
+) -> dict[int, tuple[int, LiveVideoSync]]:
+    """試合ごとに、その試合を写している動画を決める。{試合の添字: (動画の添字, 時刻合わせ)}。
+
+    ライブ記録と同じ名前の動画（録画ツールが一緒に保存したもの）は、その組で決まり。
+    残りは HP の減り方が一番よく合う組から順に決める。合う動画の無い試合には割り当てない。
+    1本の動画は1試合にしか割り当てない。
+    """
+    result: dict[int, tuple[int, LiveVideoSync]] = {}
+    used: set[int] = set()
+
+    def sync_of(i: int, k: int) -> Optional[LiveVideoSync]:
+        hp = video_hps[k]
+        return align_live_to_video(matches[i].hp_samples, hp, matches[i].rounds) if hp else None
+
+    for i, stem in enumerate(match_stems):
+        k = next((k for k, v in enumerate(video_stems) if v == stem and k not in used), None)
+        if stem is None or k is None:
+            continue
+        sync = sync_of(i, k)
+        if sync:
+            result[i] = (k, sync)
+            used.add(k)
+    pairs = [
+        (i, k, sync_of(i, k))
+        for i in range(len(matches)) if i not in result
+        for k in range(len(video_stems)) if k not in used
+    ]
+    for i, k, sync in sorted(pairs, key=lambda x: -_sync_score(x[2])):
+        if sync and i not in result and k not in used:
+            result[i] = (k, sync)
+            used.add(k)
+    return result
+
+
 def _fmt_clock(sec: float) -> str:
     return f"{int(sec // 60)}:{int(sec % 60):02d}"
 
 
-def _seek_link(video_sec: float, text: str) -> str:
-    return f'<a class="seek" data-t="{video_sec:.1f}">{text}</a>'
+def _seek_link(video_sec: float, text: str, video_index: int = 0) -> str:
+    """その場面へ飛ぶリンク。動画が複数ある時は video_index で何番目の動画かを指す"""
+    which = f' data-v="{video_index}"' if video_index else ""
+    return f'<a class="seek" data-t="{video_sec:.1f}"{which}>{text}</a>'
 
 
 def _video_src(video_path: Path, out_path: Path) -> str:
@@ -2518,6 +2764,7 @@ def _build_round_rows_html(
     p2_name: str,
     viewpoint: int = 1,
     to_video: ToVideo = None,
+    video_index: int = 0,
 ) -> str:
     html = ""
     for r in rounds:
@@ -2529,7 +2776,8 @@ def _build_round_rows_html(
             badge = _result_badge(r.p1_won, p1_name, p2_name, viewpoint)
         start = to_video(r.start_sec) if to_video else None
         # ラウンドの頭はそのまま見たいので、手前に戻るぶんを足しておく
-        jump = "" if start is None else " " + _seek_link(start + SEEK_LEAD_SEC, f"動画 {_fmt_clock(start)}〜")
+        jump = "" if start is None else " " + _seek_link(
+            start + SEEK_LEAD_SEC, f"動画 {_fmt_clock(start)}〜", video_index)
         html += (
             f'<div class="round-row">'
             f'<b>R{r.round_num}</b> {badge}'
@@ -2572,6 +2820,7 @@ def _build_hp_chart_script(
     p1_label: str,
     p2_label: str,
     video_time: bool = False,
+    video_index: int = 0,
 ) -> str:
     # 横軸が動画の再生位置の時は 分:秒 で出し、グラフをクリックするとその場面へ飛ぶ
     if video_time:
@@ -2579,8 +2828,8 @@ def _build_hp_chart_script(
         click_js = """
       onClick: (evt, _els, chart) => {
         const hit = chart.getElementsAtEventForMode(evt, 'index', {intersect: false}, false);
-        if (hit.length) seekTo(hpData[hit[0].index][0]);
-      },"""
+        if (hit.length) seekTo(hpData[hit[0].index][0], VIDEO_INDEX);
+      },""".replace("VIDEO_INDEX", str(video_index))
     else:
         label_js = "d => d[0].toFixed(1) + 's'"
         click_js = ""
@@ -2666,12 +2915,12 @@ def _build_multi_match_chart_section(
             f'<div class="match-section">'
             f'<h3>試合 {m.match_num} — {result} '
             f'({m.start_sec:.0f}s〜{m.end_sec:.0f}s)</h3>'
-            f'{_build_round_rows_html(m.rounds, p1_name, p2_name, viewpoint, to_video)}'
+            f'{_build_round_rows_html(m.rounds, p1_name, p2_name, viewpoint, m.to_video or to_video, m.video_index or 0)}'
             f'<canvas id="{chart_id}" style="max-height:150px;margin-top:10px"></canvas>'
             f'</div>'
         )
-        hp_json, video_time = _hp_data_to_json(m.hp_samples, max_points=300, to_video=to_video)
-        scripts += _build_hp_chart_script(chart_id, hp_json, p1_name, p2_name, video_time)
+        hp_json, video_time = _hp_data_to_json(m.hp_samples, max_points=300, to_video=m.to_video or to_video)
+        scripts += _build_hp_chart_script(chart_id, hp_json, p1_name, p2_name, video_time, m.video_index or 0)
     section += "</div>"
     return section, scripts
 
@@ -2699,11 +2948,21 @@ def build_html(
     title: Optional[str] = None,
     career_events: Optional[list[DamageEvent]] = None,
     career_scope: str = "",
+    overview: Optional[list[str]] = None,
+    video_srcs: Optional[list[str]] = None,
+    video_labels: Optional[list[str]] = None,
 ) -> str:
     """video_src（レポートから見た動画の場所）があれば動画を埋め込み、to_video で
-    再生位置が分かる時刻をクリックで飛べるようにする。"""
+    再生位置が分かる時刻をクリックで飛べるようにする。
+
+    動画を試合ごとに割り当てた時は video_srcs に全部の場所を、video_labels に呼び方を渡す。
+    どの試合がどの動画かは matches の video_index / to_video に入っている。
+    """
+    video_srcs = video_srcs or ([video_src] if video_src else [])
+    video_src = video_srcs[0] if video_srcs else ""
     if not video_src:
         to_video = None
+    match_videos = {m.match_num: m.video_index for m in matches or [] if m.video_index is not None}
     # 以降の HTML 断片はすべてエスケープ済みの名前で組み立てる
     p1_name, p2_name = html.escape(p1_name), html.escape(p2_name)
     # 題名は動画のファイル名。相手の名前を伏せる時は、伏せたものを title で受け取る
@@ -2749,15 +3008,30 @@ def build_html(
         m = re.search(r"大ダメージ: (動画 )?((\d+\.\d)秒(?:（\d+:\d\d）)?)", escaped)
         if not m or not (m.group(1) or video_only):
             return escaped
-        return escaped[:m.start(2)] + _seek_link(float(m.group(3)), m.group(2)) + escaped[m.end(2):]
+        # 動画が試合ごとの時は、行の頭の「【試合N】」からどの動画かを決める
+        which = 0
+        if len(video_srcs) > 1:
+            prefix = re.match(r"【試合(\d+)】", escaped)
+            if not prefix or int(prefix.group(1)) not in match_videos:
+                return escaped
+            which = match_videos[int(prefix.group(1))]
+        return escaped[:m.start(2)] + _seek_link(float(m.group(3)), m.group(2), which) + escaped[m.end(2):]
 
     advice_html = "\n".join(f"<li>{_linkify(a)}</li>" for a in advice)
 
     video_section = ""
     if video_src:
+        switcher = ""
+        if len(video_srcs) > 1:
+            labels = video_labels or [f"動画{k + 1}" for k in range(len(video_srcs))]
+            switcher = '<div class="hint">動画: ' + " / ".join(
+                _seek_link(SEEK_LEAD_SEC, html.escape(label), k).replace('data-t=', 'data-switch="1" data-t=')
+                for k, label in enumerate(labels)
+            ) + ' &nbsp;<span id="videoNow"></span></div>'
         video_section = (
             '<div class="card video-card">'
             f'<video id="matchVideo" src="{html.escape(video_src, quote=True)}" controls preload="metadata"></video>'
+            f'{switcher}'
             '<div class="hint">点線の付いた時刻や HP グラフをクリックすると、その場面の'
             f'{SEEK_LEAD_SEC:.0f}秒手前から再生します</div></div>'
         )
@@ -2824,7 +3098,18 @@ def build_html(
         summary_title=summary_title,
         chartjs_tag=_chartjs_tag(),
         video_section=video_section,
+        overview_section=(
+            '<div class="card" style="margin-bottom:16px"><h2>📝 総評</h2><ul class="advice-list">'
+            + "".join(f"<li>{html.escape(line)}</li>" for line in overview)
+            + '</ul><div style="color:#888;font-size:.75rem">'
+            f"{OVERVIEW_MIN_COUNT}回以上か、合計{OVERVIEW_MIN_DAMAGE * 100:.0f}%以上のものだけ載せています。"
+            "詳しくは下の「被弾の内訳」とアドバイスを見てください。</div></div>"
+        ) if overview else "",
         seek_lead=SEEK_LEAD_SEC,
+        video_srcs_json=json.dumps(video_srcs).replace("</", "<\\/"),
+        video_labels_json=json.dumps(
+            video_labels or [f"動画{k + 1}" for k in range(len(video_srcs))], ensure_ascii=False,
+        ).replace("</", "<\\/"),
         round_rows=round_rows_html,
         advice_items=advice_html,
         hp_chart_section=hp_chart_section,
@@ -2922,7 +3207,33 @@ def analyze(
     player_name: Optional[str] = None,
     use_history: bool = False,
     hide_opp_name: bool = True,
-) -> None:
+    collect: bool = False,
+) -> Path:
+    """レポートを作り、その場所を返す。video_path / live_path は1つでも、複数（リスト）でもよい。
+
+    collect にすると、out_path と同じ場所に「レポート名 + COLLECT_SUFFIX」のフォルダを作り、
+    使った動画・ライブ記録・.rep をそこへコピーして、レポートもその中に作る。
+
+    ライブ記録を複数渡すと、渡した順につないだ連戦として解析する。
+    動画を複数渡すと、試合ごとにその試合を写している動画を割り当てる。
+    動画を渡さなくても、ライブ記録と同じ名前の .mp4 が隣にあればそれを使う
+    （録画ツールがライブ記録と一緒に保存したもの）。
+    """
+    def as_paths(value) -> list[Path]:
+        if value is None:
+            return []
+        return [Path(p) for p in value] if isinstance(value, (list, tuple)) else [Path(value)]
+
+    videos, lives = as_paths(video_path), as_paths(live_path)
+    if lives and not videos:
+        videos = [p.with_suffix(".mp4") for p in lives if p.with_suffix(".mp4").exists()]
+        if videos:
+            print(f"  ライブ記録と同じ名前の動画を使います: {len(videos)}本")
+    if len(videos) > 1 and not lives:
+        raise AnalyzeError("動画を複数指定する時は、ライブ記録も指定してください")
+    video_path = videos[0] if videos else None
+    live_path = lives[0] if lives else None
+
     # ── プレイヤー名・キャラの決定
     explicit_p1_char, explicit_p2_char = p1_char, p2_char
     p1_name, p2_name = "P1", "P2"
@@ -2959,9 +3270,15 @@ def analyze(
     # ── ライブJSON 解析（HPデータも取得）
     live_frames: list[dict] = []
     recorded_matches: list[dict] = []
-    if live_path and live_path.exists():
-        print(f"  ライブ記録解析: {live_path.name}")
-        all_hp, live_p1_stats, live_p2_stats, live_frames, live_meta = parse_live_json(live_path, p1_name, p2_name)
+    match_file: dict[int, int] = {}     # 試合番号 → lives の何番目のファイルか
+    live_metas: list[dict] = []
+    missing = [p for p in lives if not p.exists()]
+    if missing:
+        raise AnalyzeError(f"ライブ記録が見つかりません: {missing[0]}")
+    if lives:
+        print("  ライブ記録解析: " + " / ".join(p.name for p in lives))
+        (all_hp, live_p1_stats, live_p2_stats, live_frames,
+         live_meta, match_file, live_metas) = load_live_files(lives, p1_name, p2_name)
         # 記録時にメモリから読んだキャラ。手動指定が無ければファイル名からの推定より優先する。
         # 連戦の途中でキャラを変えた時は、全体としては一番多く使ったキャラを採る
         recorded_matches = live_meta.get("matches") or []
@@ -2982,7 +3299,16 @@ def analyze(
 
     # ── 動画 HP サンプリング
     video_hp: list[tuple[float, float, float]] = []
-    if video_path and not all_hp:
+    video_hps: list[Optional[list]] = []    # 動画が複数の時の、動画ごとの HP（読めなかった動画は None）
+    if len(videos) > 1:
+        # 試合ごとに割り当てるのは、試合とラウンドを分けた後
+        for v in videos:
+            try:
+                video_hps.append(read_video_hp(v))
+            except AnalyzeError as e:
+                print(f"  動画を読めなかったため使いません: {e}")
+                video_hps.append(None)
+    elif video_path and not all_hp:
         all_hp = read_video_hp(video_path)
     elif video_path and all_hp:
         # ライブデータのHP + 動画の両方ある場合はライブデータ優先。
@@ -3086,6 +3412,34 @@ def analyze(
         total_p2 = sum(sum(1 for e in m.damage_events if e.target == "p2") for m in matches)
         print(f"  ダメージイベント検出: P1被弾{total_p1}件 / P2被弾{total_p2}件")
 
+    # ── 動画が複数の時: 試合ごとに割り当てる
+    video_labels: list[str] = []
+    if len(videos) > 1 and len(matches) > 1:
+        stems = [lives[match_file[g[0].get("match", 1)]].stem for g in match_groups]
+        assigned = assign_videos(matches, stems, [v.stem for v in videos], video_hps)
+        order = list(dict.fromkeys(k for _, (k, _) in sorted(assigned.items())))   # 試合の順
+        for i, (k, sync) in sorted(assigned.items()):
+            m = matches[i]
+            m.video_index, m.to_video = order.index(k), sync.video_sec
+            for e in m.damage_events:
+                e.video_sec = sync.video_sec(e.time_sec)
+            print(f"  試合{m.match_num} の動画: {videos[k].name}")
+        for m in matches:
+            if m.video_index is None:
+                print(f"  試合{m.match_num} に合う動画はありませんでした")
+        videos = [videos[k] for k in order]
+        video_labels = [
+            "・".join(f"試合{m.match_num}" for m in matches if m.video_index == n) for n in range(len(videos))
+        ]
+        video_path = videos[0] if videos else None
+    elif len(videos) > 1:
+        # 試合は1つ。一番よく合う動画を、その試合の動画として使う
+        syncs = [align_live_to_video(all_hp, hp, rounds) if hp else None for hp in video_hps]
+        best = max(range(len(videos)), key=lambda k: _sync_score(syncs[k]))
+        videos, video_hp = [videos[best]], video_hps[best] or []
+        video_path = videos[0]
+        print(f"  動画は {video_path.name} を使います")
+
     # ── ライブ記録と動画の時刻合わせ（両方ある時のみ）
     # to_video: 記録の時刻 → 動画の再生位置。動画だけの解析では記録の時刻がそのまま再生位置
     to_video: ToVideo = (lambda sec: sec) if video_path and not live_frames else None
@@ -3156,9 +3510,14 @@ def analyze(
         _plain = [re.sub(r"^【試合\d+】\s*", "", a) for a in advice]
         _notable = [a for a in _plain if a.startswith(("⚠️", "💡"))][:5]
 
+        # 同じ対戦かどうかは、ライブ記録なら記録した日時で見分ける。
+        # 前の版は場所で見分けていたので、その分も置き換えの対象にする
+        _keys = [history_key(p, meta) for p, meta in zip(lives, live_metas)] or [history_key(video_path)]
+        _old_keys = [str(p.resolve()) for p in lives or [video_path]]
         save_session(
             _hist_name,
-            source=str((live_path or video_path).resolve()),
+            source="+".join(_keys),
+            aliases=_old_keys,
             self_char=self_char,
             opp_char=opp_char,
             round_wins=_rw,
@@ -3177,13 +3536,21 @@ def analyze(
                     match_record(m.match_num, m.damage_events, viewpoint, m.p1_char, m.p2_char, m.p1_won)
                     for m in matches
                 ]
+                record_files = [match_file[g[0].get("match", 1)] for g in match_groups]
                 main_chars, current = (group[0].p1_char, group[0].p2_char), len(group)
             else:
                 records = [match_record(
                     1, damage_events, viewpoint, p1_char, p2_char, match_winner_from_rounds(rounds),
                 )]
+                record_files = [0]
                 main_chars, current = (p1_char, p2_char), 1
-            total = save_match_records(_hist_name, str((live_path or video_path).resolve()), records)
+            # ファイルごとに保存する（後でその中の1つだけ解析し直しても、二重に数えない）
+            total = 0
+            for k in range(len(lives)):
+                total = save_match_records(
+                    _hist_name, _keys[k], [r for r, f in zip(records, record_files) if f == k],
+                    aliases=[_old_keys[k]],
+                )
             print(f"  [履歴] 被弾の記録を保存（累計 {total} 試合）")
             c_self, c_opp = main_chars if viewpoint == 1 else main_chars[::-1]
             if c_self and c_opp:
@@ -3256,6 +3623,21 @@ def analyze(
         group, breakdown_scope = main_matchup(matches)
         breakdown_events = [e for m in group for e in m.damage_events]
 
+    # ── 使ったファイルをフォルダにまとめる（動画の場所がレポートに入るので、レポートを作る前に）
+    if collect:
+        folder = out_path.parent / (out_path.stem + COLLECT_SUFFIX)
+        print(f"  使ったファイルをまとめます: {folder}")
+        videos = collect_files(folder, videos)
+        video_path = videos[0] if videos else None
+        collect_files(folder, lives + ([rep_path] if rep_path and rep_path.exists() else []))
+        out_path = folder / out_path.name
+
+    overview = overview_lines(
+        breakdown_events, "p1" if viewpoint == 1 else "p2", self_stats, career_events, career_scope,
+    ) if live_frames else []
+    for line in overview:
+        print(f"  [総評] {line}")
+
     # ── HTML 出力
     html = build_html(
         video_path, rounds, all_hp, rep, advice, p1_name, p2_name,
@@ -3265,6 +3647,8 @@ def analyze(
         ai_text=ai_text,
         rep_opp=rep_opp,
         video_src=_video_src(video_path, out_path) if video_path else "",
+        video_srcs=[_video_src(v, out_path) for v in videos],
+        video_labels=video_labels,
         to_video=to_video,
         card_summaries=card_summaries,
         breakdown_events=breakdown_events if live_frames else None,
@@ -3272,6 +3656,7 @@ def analyze(
         title=report_title,
         career_events=career_events,
         career_scope=career_scope,
+        overview=overview,
         # 試合ごとにキャラが違う時は、見出しには出さず各試合の欄に出す
         char_label=(
             f"{char_display_name(p1_char)} vs {char_display_name(p2_char)}"
@@ -3281,6 +3666,7 @@ def analyze(
     )
     out_path.write_text(html, encoding="utf-8")
     print(f"  レポート出力: {out_path}")
+    return out_path
 
 
 def main() -> None:
@@ -3288,7 +3674,10 @@ def main() -> None:
     parser.add_argument("video", nargs="?", help="入力 .mp4 ファイル（--live のみの場合は省略可）")
     parser.add_argument("rep", nargs="?", help="入力 .rep ファイル（省略可）")
     parser.add_argument("-o", "--output", help="出力 HTML パス（省略時は動画と同ディレクトリ）")
-    parser.add_argument("--live", help="soku_live_reader.py で記録した JSON ファイル")
+    parser.add_argument("--live", nargs="+",
+                        help="ライブ記録の JSON ファイル。複数並べると、その順につないだ連戦として解析する")
+    parser.add_argument("--videos", nargs="+", default=[],
+                        help="追加の動画。試合ごとに動画が分かれている時に並べる（--live が必要）")
     parser.add_argument(
         "--viewpoint", type=int, choices=[1, 2], default=1,
         help="解説視点: 1=P1（左）, 2=P2（右）。自分がどちら側か指定",
@@ -3296,6 +3685,8 @@ def main() -> None:
     parser.add_argument("--p1-char", help="P1キャラID（例: aya）。省略時はファイル名から推定")
     parser.add_argument("--p2-char", help="P2キャラID（例: yuyuko）")
     parser.add_argument("--ai", action="store_true", help="AI自然文コーチングを生成（要 SOKU_AI_API_KEY）")
+    parser.add_argument("--collect", action="store_true",
+                        help="使った動画・ライブ記録・.rep を1つのフォルダにコピーし、レポートもそこに作る")
     parser.add_argument("--show-opp-name", action="store_true",
                         help="レポートに相手の名前を出す（指定しなければ「相手」と出す）")
     args = parser.parse_args()
@@ -3304,19 +3695,14 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
-    video_path: Optional[Path] = None
-    if args.video:
-        video_path = Path(args.video)
-        if not video_path.exists():
-            print(f"ERROR: {video_path} が見つかりません", file=sys.stderr)
+    video_paths = [Path(p) for p in ([args.video] if args.video else []) + args.videos]
+    live_paths = [Path(p) for p in args.live or []]
+    for p in video_paths + live_paths:
+        if not p.exists():
+            print(f"ERROR: {p} が見つかりません", file=sys.stderr)
             sys.exit(1)
-
-    live_path: Optional[Path] = None
-    if args.live:
-        live_path = Path(args.live)
-        if not live_path.exists():
-            print(f"ERROR: ライブ記録ファイル {live_path} が見つかりません", file=sys.stderr)
-            sys.exit(1)
+    video_path: Optional[Path] = video_paths[0] if video_paths else None
+    live_path: Optional[Path] = live_paths[0] if live_paths else None
 
     # .rep 自動探索
     rep_path: Optional[Path] = None
@@ -3340,12 +3726,13 @@ def main() -> None:
 
     try:
         analyze(
-            video_path, rep_path, out_path, live_path,
+            video_paths, rep_path, out_path, live_paths,
             viewpoint=args.viewpoint,
             p1_char=normalize_char_id(args.p1_char) if args.p1_char else None,
             p2_char=normalize_char_id(args.p2_char) if args.p2_char else None,
             use_ai=args.ai,
             hide_opp_name=not args.show_opp_name,
+            collect=args.collect,
         )
     except AnalyzeError as e:
         print(f"ERROR: {e}", file=sys.stderr)
