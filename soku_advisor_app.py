@@ -429,22 +429,28 @@ class SokuAdvisorApp(tk.Tk):
         ttk.Entry(opts, textvariable=self._player_name_var).grid(
             row=3, column=1, sticky="ew", padx=(8, 0), pady=4)
 
+        self._hide_opp_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            opts, text="レポートで相手の名前を伏せる（「相手」と表示）",
+            variable=self._hide_opp_var,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 2))
+
         self._use_ai_var = tk.BooleanVar(value=False)
         ai_state = "normal" if ai_available() else "disabled"
         ttk.Checkbutton(
             opts, text="AI自然文コーチング（要 SOKU_AI_API_KEY）",
             variable=self._use_ai_var, state=ai_state,
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 2))
 
         self._use_history_var = tk.BooleanVar(value=True)
         self._history_cb = ttk.Checkbutton(
             opts, text="過去履歴を蓄積・参照する（プレイヤー名が必要）",
             variable=self._use_history_var,
         )
-        self._history_cb.grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self._history_cb.grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 4))
 
         self._history_label = ttk.Label(opts, text="", style="Caption.TLabel")
-        self._history_label.grid(row=6, column=0, columnspan=2, sticky="w")
+        self._history_label.grid(row=7, column=0, columnspan=2, sticky="w")
         self._player_name_var.trace_add("write", self._update_history_label)
         self._update_history_label()
 
@@ -793,6 +799,7 @@ class SokuAdvisorApp(tk.Tk):
         _p1_char = parse_char_choice(self._p1_char_var.get())
         _p2_char = parse_char_choice(self._p2_char_var.get())
         _use_ai = self._use_ai_var.get()
+        _hide_opp = self._hide_opp_var.get()
 
         def run():
             try:
@@ -807,6 +814,7 @@ class SokuAdvisorApp(tk.Tk):
                     use_ai=_use_ai,
                     player_name=_pname,
                     use_history=_use_hist,
+                    hide_opp_name=_hide_opp,
                 )
                 self._post(self._on_report_done, out)
             except AnalyzeError as e:

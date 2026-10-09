@@ -191,6 +191,49 @@ class DamageTests(unittest.TestCase):
         lines = an.analyze_damage_patterns(an.detect_damage_events(self._frames()), "p1", "P1")
         self.assertFalse(any("始動技" in ln or "相手→" in ln for ln in lines))
 
+    def _hit(self, before, at_hit=71, opp=306):
+        """P1 が before のアクションの直後に 10% 食らう記録の、その被弾"""
+        frames = []
+        for i in range(300):
+            act = before if 80 <= i < 100 else at_hit if 100 <= i < 130 else 0
+            frames.append({"t": round(i / 60, 4), "f": i, "match": 1,
+                           "p1": side(hp=10000 - 200 * max(0, min(i - 99, 5)), act=act),
+                           "p2": side(act=opp if 80 <= i < 105 else 0)})
+        events = an.detect_damage_events(frames)
+        self.assertEqual(len(events), 1)
+        return events[0]
+
+    def test_situation_names_the_movement_or_idle_state(self):
+        labels = {200: "前ダッシュ中", 201: "バックステップ中", 214: "飛翔中", 209: "ハイジャンプ中",
+                  230: "ダッシュ・飛翔中", 0: "立ち", 2: "しゃがみ", 5: "後ろ歩き中", 7: "ジャンプ中",
+                  695: "カード使用中", 400: "射撃中"}
+        for act, label in labels.items():
+            self.assertEqual(self._hit(act).what_was_doing(), label, act)
+
+    def test_chip_damage_and_crush_are_told_apart_from_a_plain_guard(self):
+        self.assertEqual(self._hit(150, at_hit=150).what_was_doing(), "ガード中（削り）")
+        self.assertEqual(self._hit(150, at_hit=71).what_was_doing(), "ガード中")
+        self.assertEqual(self._hit(156, at_hit=143).what_was_doing(), "ガードクラッシュ中")
+
+    def test_spell_starters_get_the_card_name_once_the_character_is_known(self):
+        event = self._hit(0, opp=607)
+        self.assertEqual(event.opp_move, "スペルカード(607)")
+        an.name_spell_moves([event], "reimu", None)      # 攻撃側（P2）のキャラが分からない
+        self.assertEqual(event.opp_move, "スペルカード(607)")
+        an.name_spell_moves([event], "reimu", "iku")
+        self.assertEqual(event.opp_move, "羽衣「羽衣は空の如く」")
+        alt = self._hit(0, opp=657)
+        an.name_spell_moves([alt], "reimu", "iku")
+        self.assertEqual(alt.opp_move, "羽衣「羽衣は空の如く」")
+
+    def test_breakdown_groups_situations_under_each_starter(self):
+        events = [self._hit(200), self._hit(200), self._hit(300), self._hit(214, opp=411),
+                  self._hit(0, opp=0)]
+        rows = an.damage_breakdown(events)
+        self.assertEqual([(move, len(group)) for move, group, _ in rows], [("JA", 3), ("6C", 1), ("", 1)])
+        self.assertEqual([(name, n, round(total, 2)) for name, n, total in rows[0][2]],
+                         [("前ダッシュ中", 2, 0.2), ("打撃中", 1, 0.1)])
+
     def test_time_format(self):
         self.assertEqual(an._fmt_time(46.94), "46.9秒")
         self.assertEqual(an._fmt_time(214.1), "214.1秒（3:34）")
@@ -254,6 +297,36 @@ class LiveStatsTests(unittest.TestCase):
         self.assertEqual(an._combo_key(1024), 512)        # 623 の C
         self.assertEqual(an._combo_key(514), 2)           # 複数立っていたら下位
         self.assertEqual(an._combo_key(524288), 524288)   # 未対応のコマンドは生値
+
+
+class GuardTests(unittest.TestCase):
+    def _frames(self):
+        """P1 が 立ち正ガード → 立ちで下段(303)を受ける ×2 → しゃがみで中段(302)を受ける → クラッシュ"""
+        plan = [(100, 150, 300), (200, 159, 303), (300, 160, 303), (400, 163, 302), (500, 143, 302)]
+        frames = [{"t": round(i / 60, 4), "f": i, "match": 1, "p1": side(), "p2": side()} for i in range(700)]
+        for start, guard, attack in plan:
+            for i in range(start - 15, start + 5):
+                frames[i]["p2"]["act"] = attack
+            for i in range(start, start + 20):
+                frames[i]["p1"]["act"] = guard
+        return frames
+
+    def test_guards_are_counted_by_kind_with_the_move_that_caused_a_wrong_one(self):
+        p1, p2 = an.parse_live_stats_from_frames(self._frames())
+        self.assertEqual(p1.guard_counts, {"right": 1, "wrong_high": 2, "wrong_low": 1, "crush": 1})
+        self.assertEqual(dict(p1.wrong_guard_moves["wrong_high"]), {"2A": 2})
+        self.assertEqual(dict(p1.wrong_guard_moves["wrong_low"]), {"6A": 1})
+        self.assertEqual(p2.guard_counts, {})
+        self.assertEqual(p2.guard_summary(), "")
+
+    def test_advice_lists_wrong_guards(self):
+        p1, _ = an.parse_live_stats_from_frames(self._frames())
+        advice = []
+        an._advice_from_live(advice, p1)
+        self.assertIn("🛡️ ガード: 正ガード 1回 / 誤ガード 3回（立ちガードで下段 2回・しゃがみガードで中段 1回）/ "
+                      "空中ガード 0回 / ガードクラッシュ 1回", advice)
+        self.assertIn("  立ちガードで受けた下段: 2A 2回", advice)
+        self.assertIn("  しゃがみガードで受けた中段: 6A 1回", advice)
 
 
 class RepTests(unittest.TestCase):
@@ -375,6 +448,22 @@ class CardTests(unittest.TestCase):
                       "<td style=\"text-align:center\"><b>1回</b></td>", report)
         self.assertIn("<td>「霊撃札」</td><td style=\"text-align:center\">2枚</td>", report)
         self.assertIn("疾風扇", report)
+
+    def test_report_has_the_breakdown_table_with_spell_names(self):
+        frames = make_round(0, 0.0)
+        for f in frames[:120]:
+            f["p1"]["act"] = 601          # 霊夢の夢想封印を出している間に P2 の HP が減る
+            f["p2"]["act"] = 200 if f["f"] < 1 else 71
+        live = self.tmp / "breakdown.json"
+        live.write_text(json.dumps({"meta": {"version": 5, "matches": [
+            {"match": 1, "p1_char": "reimu", "p2_char": "aya"},
+        ]}, "frames": frames}), encoding="utf-8")
+        out = self.tmp / "breakdown.html"
+        an.analyze(None, None, out, live)
+        report = out.read_text(encoding="utf-8")
+        self.assertIn("🎯 被弾の内訳", report)
+        self.assertIn("<td>神霊「夢想封印」</td><td style=\"text-align:center\">1回</td>", report)
+        self.assertIn("前ダッシュ中 1回", report)
 
 
 class RepSyncTests(unittest.TestCase):
@@ -503,6 +592,50 @@ class AnalyzeTests(unittest.TestCase):
 
     def _two_matches(self):
         return make_round(0, 0.0, match=1) + make_round(2000, 100.0, match=2)
+
+    def _named(self, name="2027_じぶん(aya) vs あいて(yuyuko).json"):
+        return self._write(name, make_round(0, 0.0), [{"match": 1, "p1_char": "aya", "p2_char": "yuyuko"}])
+
+    def test_opponent_name_is_hidden_by_default(self):
+        self.assertEqual(an.hide_opponent("2027_じぶん(aya) vs あいて(yuyuko)", 1),
+                         ("じぶん", "相手", "2027_じぶん(aya) vs 相手(yuyuko)"))
+        self.assertEqual(an.hide_opponent("2027_じぶん(aya) vs あいて(yuyuko)", 2),
+                         ("相手", "あいて", "2027_相手(aya) vs あいて(yuyuko)"))
+        self.assertEqual(an.hide_opponent("live_20261009", 1), ("P1", "P2", "live_20261009"))
+        out = self.tmp / "hidden.html"
+        an.analyze(None, None, out, self._named())
+        report = out.read_text(encoding="utf-8")
+        self.assertNotIn("あいて", report)
+        self.assertIn("じぶん", report)
+        self.assertNotIn("相手（相手）", report)
+        # P2 視点なら伏せるのは P1
+        an.analyze(None, None, out, self._named(), viewpoint=2)
+        report = out.read_text(encoding="utf-8")
+        self.assertNotIn("じぶん", report)
+        self.assertIn("あいて", report)
+
+    def test_opponent_name_can_be_shown_but_never_goes_to_the_ai(self):
+        sent = []
+        real = (an.ai_available, an.generate_ai_advice)
+        an.ai_available = lambda: True
+        an.generate_ai_advice = lambda payload: sent.append(payload) or "ok"
+        try:
+            out = self.tmp / "shown.html"
+            an.analyze(None, None, out, self._named(), hide_opp_name=False, use_ai=True)
+        finally:
+            an.ai_available, an.generate_ai_advice = real
+        self.assertIn("あいて", out.read_text(encoding="utf-8"))
+        payload = json.dumps(sent[0], ensure_ascii=False)
+        self.assertNotIn("あいて", payload)
+        self.assertIn("じぶん", payload)
+
+    def test_hidden_title_is_used_for_a_video_report(self):
+        html_text = an.build_html(
+            Path("2027_じぶん(aya) vs あいて(yuyuko).mp4"), [], [(0.0, 1.0, 1.0)], None, [],
+            "じぶん", "相手", title="2027_じぶん(aya) vs 相手(yuyuko)",
+        )
+        self.assertIn("<title>Soku Advisor — 2027_じぶん(aya) vs 相手(yuyuko)</title>", html_text)
+        self.assertNotIn("あいて", html_text)
 
     def test_multi_match_report_shows_characters_per_match(self):
         live = self._write("multi.json", self._two_matches(), [
