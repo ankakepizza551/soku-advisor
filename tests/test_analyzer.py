@@ -152,7 +152,8 @@ class DamageTests(unittest.TestCase):
         self.assertEqual(events[1].what_was_doing(), "起き上がり直後")
         lines = an.analyze_damage_patterns(events, "p1", "P1")
         self.assertIn("  相手の始動技ごとの被ダメージ: 6C 20%・1回、JA 10%・1回", lines)
-        self.assertTrue(any(ln.endswith("直前→起き上がり直後 / 相手→6C") for ln in lines))
+        # 6C は当たる 30 フレーム前に出し終えている（弾が後から当たった）ので、時間差の推定と分かるように出す
+        self.assertTrue(any(ln.endswith("直前→起き上がり直後 / 相手→6C（時間差で命中）") for ln in lines))
         # 同じ被弾を攻撃側から見ると、P2 の与ダメージになる
         self.assertEqual(an.analyze_offense(events, "p1", "P2"),
                          ["🗡️ P2 の始動技ごとの与ダメージ: 6C 20%・1回、JA 10%・1回"])
@@ -342,6 +343,161 @@ class DamageTests(unittest.TestCase):
     def test_time_format(self):
         self.assertEqual(an._fmt_time(46.94), "46.9秒")
         self.assertEqual(an._fmt_time(214.1), "214.1秒（3:34）")
+
+
+def runs_to_acts(runs, total):
+    """[(アクションID, フレーム数), ...] を 1 フレームずつの並びにし、total フレームまで最後の値で埋める"""
+    acts = [act for act, n in runs for _ in range(n)]
+    return (acts + [acts[-1] if acts else 0] * total)[:total]
+
+
+class HitContextTests(unittest.TestCase):
+    """被弾の状況（起き上がり直後・始動技・ヒット数）の判定。
+
+    P1 が hit_at フレーム目から 5 フレーム続けて 2.4% ずつ（合計 12%。大ダメージの行に出る）HP を減らされる記録を作る。
+    victim / attacker は被弾までの両者のアクションの並び。被弾中の P1 はやられ状態（71）。
+    アクションIDの意味は SokuLib の Action.hpp による（197〜199 は受け身、71 は空中やられ、
+    306 は JA、411 は 6C、214 は飛翔、201 はバックステップ、4 は前歩き）。
+    """
+
+    TOTAL = 400
+
+    def _event(self, victim, attacker, hit_at, combo=None):
+        mine = runs_to_acts(victim, hit_at) + [71] * (self.TOTAL - hit_at)
+        theirs = runs_to_acts(attacker, self.TOTAL)
+        frames = []
+        for i in range(self.TOTAL):
+            hp = 10000 - 240 * max(0, min(i - hit_at + 1, 5))
+            p1, p2 = side(hp=hp, act=mine[i]), side(act=theirs[i])
+            if mine[i] is None:
+                del p1["act"]
+            if combo is not None:
+                p2["cc"] = combo[i] if i < len(combo) else combo[-1]
+            frames.append({"t": round(i / 60, 4), "f": i, "match": 1, "p1": p1, "p2": p2})
+        events = an.detect_damage_events(frames)
+        self.assertEqual(len(events), 1)     # 始動技が分からなくても、被弾そのものは残す
+        self.assertAlmostEqual(events[0].damage_pct, 0.12)
+        return events[0]
+
+    # ── 起き上がり直後
+    def test_hit_right_as_the_tech_roll_ends_is_a_wakeup_hit(self):
+        e = self._event([(0, 40), (198, 30)], [(0, 60), (306, 40)], hit_at=70)
+        self.assertTrue(e.after_down)
+        self.assertEqual(e.what_was_doing(), "起き上がり直後")
+
+    def test_hit_shortly_after_the_tech_roll_is_a_wakeup_hit(self):
+        e = self._event([(0, 40), (198, 30), (0, 10)], [(0, 70), (306, 40)], hit_at=80)
+        self.assertTrue(e.after_down)
+
+    def test_action_taken_right_after_waking_up_is_shown_with_the_wakeup(self):
+        # 実記録にあった形: 受け身の後にバックステップ（11 フレーム）して食らう
+        e = self._event([(0, 40), (198, 30), (201, 11)], [(0, 70), (306, 40)], hit_at=81)
+        self.assertTrue(e.after_down)
+        self.assertEqual(e.what_was_doing(), "起き上がり直後（バックステップ中）")
+
+    def test_enough_time_after_waking_up_is_not_a_wakeup_hit(self):
+        # 実記録では受け身の 47〜89 フレーム後の被弾があった。WAKEUP_HIT_FRAMES 以上空けば起き上がり直後ではない
+        e = self._event([(0, 10), (198, 30), (4, an.WAKEUP_HIT_FRAMES)],
+                        [(0, 60), (306, 40)], hit_at=40 + an.WAKEUP_HIT_FRAMES)
+        self.assertFalse(e.after_down)
+        self.assertEqual(e.what_was_doing(), "前歩き中")
+        just_inside = self._event([(0, 10), (198, 30), (4, an.WAKEUP_HIT_FRAMES - 1)],
+                                  [(0, 60), (306, 40)], hit_at=39 + an.WAKEUP_HIT_FRAMES)
+        self.assertTrue(just_inside.after_down)
+
+    def test_down_that_ended_long_before_the_hit_is_not_a_wakeup_hit(self):
+        e = self._event([(198, 30), (0, 150)], [(0, 170), (306, 40)], hit_at=180)
+        self.assertFalse(e.after_down)
+
+    def test_recording_that_starts_standing_has_no_wakeup_hit(self):
+        e = self._event([(0, 100)], [(0, 90), (306, 40)], hit_at=100)
+        self.assertFalse(e.after_down)
+
+    def test_missing_actions_after_the_down_do_not_count_as_a_wakeup(self):
+        # 受け身の後のアクションが記録されていなければ、その間に何をしていたか分からないので断定しない
+        e = self._event([(0, 40), (198, 30), (None, 10)], [(0, 70), (306, 40)], hit_at=80)
+        self.assertFalse(e.after_down)
+
+    # ── 始動技
+    def test_melee_still_out_when_the_hit_lands_is_the_starter(self):
+        e = self._event([(0, 70)], [(0, 60), (306, 30)], hit_at=70)
+        self.assertEqual((e.opp_move, e.opp_delayed), ("JA", False))
+
+    def test_bullet_that_lands_after_the_attacker_moved_on_is_a_delayed_starter(self):
+        # 実記録にあった形: 6C を撃ってから飛翔に移った後に当たる
+        e = self._event([(0, 80)], [(0, 20), (411, 30), (214, 50)], hit_at=80)
+        self.assertEqual((e.opp_move, e.opp_delayed), ("6C", True))
+
+    def test_finished_melee_is_not_taken_for_a_bullet_hit(self):
+        # 6C を撃った後に JA を空振りして飛翔。JA はもう終わっているので当たりようがない。当てたのは 6C
+        e = self._event([(0, 85)], [(0, 10), (411, 30), (0, 5), (306, 20), (214, 50)], hit_at=85)
+        self.assertEqual((e.opp_move, e.opp_delayed), ("6C", True))
+
+    def test_finished_melee_alone_leaves_the_starter_unknown(self):
+        e = self._event([(0, 85)], [(0, 10), (306, 20), (0, 70)], hit_at=85)
+        self.assertEqual((e.opp_act, e.opp_move), (None, ""))
+
+    def test_no_attack_in_the_window_leaves_the_starter_unknown(self):
+        e = self._event([(0, 100)], [(0, 200)], hit_at=100)
+        self.assertEqual(e.opp_move, "")
+        lines = an.analyze_damage_patterns([e], "p1", "P1")
+        self.assertFalse(any("相手→" in ln for ln in lines))
+
+    def test_chain_of_attacks_takes_the_one_out_at_the_hit(self):
+        e = self._event([(0, 75)], [(0, 40), (300, 10), (320, 10), (321, 30)], hit_at=75)
+        self.assertEqual((e.opp_move, e.opp_delayed), ("AAA", False))
+
+    def test_delayed_starter_is_marked_in_the_big_damage_line(self):
+        e = self._event([(0, 80)], [(0, 20), (411, 30), (214, 50)], hit_at=80)
+        line = next(ln for ln in an.analyze_damage_patterns([e], "p1", "P1") if "大ダメージ" in ln)
+        self.assertIn("相手→6C（時間差で命中）", line)
+        rec = json.loads(json.dumps(an.event_to_record(e, "p1")))
+        self.assertTrue(an.event_from_record(rec).opp_delayed)
+
+    # ── ヒット数
+    def test_without_the_combo_counter_the_count_is_shown_as_hp_drop_frames(self):
+        e = self._event([(0, 70)], [(0, 60), (306, 30)], hit_at=70)
+        self.assertEqual((e.hits, e.combo_hits), (5, None))
+        line = next(ln for ln in an.analyze_damage_patterns([e], "p1", "P1") if "大ダメージ" in ln)
+        self.assertIn("（HP減少 5フレーム）", line)
+        self.assertNotIn("ヒット", line)
+
+    def test_combo_counter_gives_the_real_hit_count(self):
+        # 実記録: 相手のコンボ数（攻撃側に付く）は 1 フレームで 2 つ以上増えることがある（3→7）
+        combo = [0] * 70 + [1, 3, 4, 4, 5]
+        e = self._event([(0, 70)], [(0, 60), (306, 30)], hit_at=70, combo=combo)
+        self.assertEqual((e.hits, e.combo_hits), (5, 5))
+        combo = [0] * 70 + [2, 2, 3, 7, 8]
+        e = self._event([(0, 70)], [(0, 60), (306, 30)], hit_at=70, combo=combo)
+        self.assertEqual(e.combo_hits, 8)
+        line = next(ln for ln in an.analyze_damage_patterns([e], "p1", "P1") if "大ダメージ" in ln)
+        self.assertIn("（8ヒット）", line)
+
+    def test_combo_counter_handles_a_reset_and_a_combo_carried_over(self):
+        # 前のコンボの数（9）が残っていて、新しいコンボで 1 に戻る
+        e = self._event([(0, 70)], [(0, 60), (306, 30)], hit_at=70, combo=[9] * 70 + [1, 2, 3, 4, 4])
+        self.assertEqual(e.combo_hits, 4)
+        # 前の被弾から同じコンボが続いている（1 から数え続ける）。この被弾のぶんだけ数える
+        e = self._event([(0, 70)], [(0, 60), (306, 30)], hit_at=70, combo=[1] * 70 + [2, 3, 3, 3, 3])
+        self.assertEqual(e.combo_hits, 2)
+        rec = json.loads(json.dumps(an.event_to_record(e, "p1")))
+        self.assertEqual(an.event_from_record(rec).combo_hits, 2)
+
+    def test_one_hit_right_after_another_one_hit_combo_is_one_hit(self):
+        # 実記録にあった形: 前の 1 ヒットのコンボ数 1 が残ったまま、次の 1 ヒットでも 1 のまま
+        e = self._event([(0, 70)], [(0, 60), (309, 30)], hit_at=70, combo=[1] * 80)
+        self.assertEqual(e.combo_hits, 1)
+
+    def test_damage_without_hitstun_has_no_hit_count(self):
+        # 実記録にあった形: 天候などで、やられ状態に入らずに HP だけが減る（コンボ数は動かない）
+        frames = []
+        for i in range(self.TOTAL):
+            hp = 10000 - 240 * max(0, min(i - 69, 5))
+            p1, p2 = side(hp=hp, act=212), side(act=9)
+            p2["cc"] = 3
+            frames.append({"t": round(i / 60, 4), "f": i, "match": 1, "p1": p1, "p2": p2})
+        e = an.detect_damage_events(frames)[0]
+        self.assertEqual((e.combo_hits, e.hits), (None, 5))
 
 
 class LiveStatsTests(unittest.TestCase):

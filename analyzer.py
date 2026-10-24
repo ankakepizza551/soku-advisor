@@ -256,7 +256,12 @@ DAMAGE_THRESHOLD = 0.05   # 一連の被弾で合計5%以上減ったらダメ�
 DAMAGE_WINDOW_SEC = 1.5   # ダメージ直前 N 秒を「直前行動」として分析
 BIG_DAMAGE = 0.10         # これ以上の被弾は「大ダメージ」として時刻を出す
 COMBO_GAP_SEC = 1.0     # 次のヒットまでこの秒数以内なら同じ被弾（コンボ）とみなす
-WAKEUP_HIT_FRAMES = 30    # ダウン（ACT_DOWN）が終わってからこのフレーム数以内の被弾は「起き上がり直後」
+# 受け身（ACT_DOWN）が終わってから、このフレーム数未満で食らった被弾を「起き上がり直後」とする。
+# 実記録では受け身の 0〜12 フレーム後の被弾（起き攻め）と、47〜89 フレーム後の被弾（立ち回りに戻った後）に分かれた
+WAKEUP_HIT_FRAMES = 30
+# 打撃は出している間にしか当たらない。被弾の瞬間に出し終えていた打撃は始動技にしない。
+# ただし記録は 1/60 秒ごとの読み取りで 1〜2 フレームずれることがあるので、その分は許す
+MELEE_HIT_SLACK = 2
 OPP_STARTER_TOP = 5       # 相手の始動技ごとの被ダメージを上位いくつまで出すか
 BREAKDOWN_TOP = 10        # 被弾の内訳の表に、始動技を上位いくつまで出すか
 SESSION_TREND_TOP = 3     # 連戦で、試合ごとの推移を出す始動技の数
@@ -289,7 +294,11 @@ class DamageEvent:
     damage_pct: float           # 一連の被弾で食らったダメージ合計 (0.0〜1.0)
     prev_inputs: list[dict]     # 最初のヒット直前1.5秒分のフレームデータ
     target: str                 # "p1" or "p2"
-    hits: int = 1               # HPが減ったフレーム数（ヒット数の目安）
+    # HP が減ったフレーム数。1 フレームに複数ヒットしたり、ヒット無しで減ったりするので
+    # 実際のヒット数とは限らない（実記録 28 件中 11 件で違った）。レポートでは「HP減少 Nフレーム」と出す
+    hits: int = 1
+    combo_hits: Optional[int] = None    # ゲームのコンボ数から数えた実際のヒット数（記録 version 7 以降）
+    opp_delayed: bool = False   # 始動技を、相手がそれを出し終えた後に当たったものと推定したか（弾など）
     spirit_before: Optional[int] = None  # 最初のヒット直前の霊力（ライブ記録のみ）
     estimated: bool = False     # prev_inputs が .rep を動画に時刻合わせして得た推定か
     opp_act: Optional[int] = None   # 最初のヒットの時点で相手が最後に出していた攻撃のアクションID（ライブ記録のみ）
@@ -467,21 +476,14 @@ def detect_damage_events(frames: list[dict], fps: int = 60) -> list[DamageEvent]
         start_i: Optional[int] = None   # 進行中の被弾の開始フレーム
         hp_before = prev
         last_hit_t = 0.0
+        last_hit_i = 0
         hits = 0
 
         def close(hp_after: float) -> None:
             if start_i is None or hp_before - hp_after < DAMAGE_THRESHOLD:
                 return
-            # 最初のヒットから遡って、相手が最後に出していた攻撃（射撃は出した後に当たることがある）
-            opp_act = next(
-                (frames[j][other].get("act") for j in range(start_i, max(0, start_i - window) - 1, -1)
-                 if act_category(frames[j][other].get("act")) in ATTACK_CATEGORIES),
-                None,
-            )
-            after_down = any(
-                frames[j][side].get("act") in ACT_DOWN
-                for j in range(max(0, start_i - WAKEUP_HIT_FRAMES), start_i)
-            )
+            opp_act, opp_delayed = _find_starter(frames, other, start_i, window)
+            after_down = _wakeup_gap(frames, side, start_i) is not None
             me, opp = frames[start_i][side], frames[start_i][other]
             has_pos = "px" in me and "px" in opp
             events.append(DamageEvent(
@@ -495,8 +497,10 @@ def detect_damage_events(frames: list[dict], fps: int = 60) -> list[DamageEvent]
                 opp_inputs=[frames[j][other] for j in range(max(0, start_i - window), start_i)],
                 target=side,
                 hits=hits,
+                combo_hits=_combo_hits(frames, other, start_i, last_hit_i, me.get("act")),
                 spirit_before=frames[start_i - 1][side].get("sp") if start_i > 0 else None,
                 opp_act=opp_act,
+                opp_delayed=opp_delayed,
                 opp_move=_act_name(opp_act, skill_names.get((other, opp_act))) if opp_act is not None else "",
                 after_down=after_down,
                 hit_act=me.get("act"),
@@ -519,6 +523,7 @@ def detect_damage_events(frames: list[dict], fps: int = 60) -> list[DamageEvent]
                     hits = 0
                 hits += 1
                 last_hit_t = t
+                last_hit_i = i
 
             prev = hp
 
@@ -526,6 +531,61 @@ def detect_damage_events(frames: list[dict], fps: int = 60) -> list[DamageEvent]
 
     events.sort(key=lambda e: e.time_sec)
     return events
+
+
+def _find_starter(frames: list[dict], attacker: str, start_i: int, window: int) -> tuple[Optional[int], bool]:
+    """最初のヒットの始動技（相手のアクションID）と、それが出し終えた後に当たった推定かどうか。
+
+    被弾の瞬間から遡って、相手が最後に出していた攻撃を探す。被弾の瞬間にまだ出していれば確か。
+    出し終えていた場合、打撃はもう当たらないので飛ばし、その前の射撃・スキル・スペルカード
+    （弾や設置物が後から当たる）を時間差の推定として採る。見つからなければ (None, False)。
+    """
+    for j in range(start_i, max(0, start_i - window) - 1, -1):
+        act = frames[j][attacker].get("act")
+        cat = act_category(act)
+        if cat not in ATTACK_CATEGORIES:
+            continue
+        since = start_i - j     # その攻撃の最後のフレームから、被弾までのフレーム数
+        if since == 0 or (cat == "melee" and since <= MELEE_HIT_SLACK):
+            return act, False
+        if cat != "melee":
+            return act, True
+    return None, False
+
+
+def _wakeup_gap(frames: list[dict], side: str, start_i: int) -> Optional[int]:
+    """受け身（ACT_DOWN）が終わってから被弾までのフレーム数。起き上がり直後でなければ None。
+
+    WAKEUP_HIT_FRAMES より前に終わっていた・ダウンしていない時は None。間のアクションが記録されて
+    いないフレームがある時も、その間に何をしていたか分からないので None（起き上がり直後と断定しない）。
+    """
+    for gap, j in enumerate(range(start_i - 1, max(-1, start_i - 1 - WAKEUP_HIT_FRAMES), -1)):
+        act = frames[j][side].get("act")
+        if act is None:
+            return None
+        if act in ACT_DOWN:
+            return gap
+    return None
+
+
+def _combo_hits(
+    frames: list[dict], attacker: str, start_i: int, last_i: int, hit_act: Optional[int] = None,
+) -> Optional[int]:
+    """ゲームのコンボ数（攻撃側に付く。記録 version 7 以降の cc）から、この被弾のヒット数を数える。
+
+    コンボ数は当たるたびに増え（1 フレームで 2 つ以上増えることもある）、新しいコンボでは 1 から
+    数え直す。前の被弾から同じコンボが続いている時は、続きの分だけ数える。
+    1 ヒットのコンボの直後にまた 1 ヒットだと、コンボ数は 1 のまま変わらない（実記録で 3 件）。
+    食らった側がやられ状態（hit_act）に入っていれば、それを 1 ヒットと数える。
+    やられ状態に入らずに減った時（天候などで HP だけが減る）や、記録に無い時は None。
+    """
+    seq = [frames[j][attacker].get("cc") for j in range(max(0, start_i - 1), min(len(frames), last_i + 3))]
+    if start_i == 0 or not seq or None in seq:
+        return None
+    total = sum(b - a if b >= a else b for a, b in zip(seq, seq[1:]))
+    if not total and seq[-1] == 1 and act_category(hit_act) == "hit":
+        return 1
+    return total or None
 
 
 def detect_damage_events_from_hp(
@@ -669,7 +729,7 @@ def event_to_record(e: DamageEvent, self_side: str) -> Optional[dict]:
     return {
         "kind": "taken" if e.target == self_side else "dealt",
         "t": round(e.time_sec, 2), "hp": round(e.hp_before, 4), "dmg": round(e.damage_pct, 4),
-        "hits": e.hits, "sp": e.spirit_before,
+        "hits": e.hits, "combo": e.combo_hits, "late": e.opp_delayed, "sp": e.spirit_before,
         "act": e.opp_act, "move": e.opp_move, "hit": e.hit_act, "down": e.after_down,
         "dist": e.distance, "corner": e.cornered,
         "v": _act_runs(e.prev_inputs),   # 食らった側
@@ -686,7 +746,8 @@ def event_from_record(rec: dict) -> DamageEvent:
         time_sec=rec["t"], hp_before=rec["hp"], hp_after=rec["hp"] - rec["dmg"], damage_pct=rec["dmg"],
         prev_inputs=_expand_runs(rec["v"]), opp_inputs=_expand_runs(rec.get("a", [])),
         target="p1" if rec["kind"] == "taken" else "p2",
-        hits=rec.get("hits", 1), spirit_before=rec.get("sp"),
+        hits=rec.get("hits", 1), combo_hits=rec.get("combo"), opp_delayed=rec.get("late", False),
+        spirit_before=rec.get("sp"),
         opp_act=rec.get("act"), opp_move=rec.get("move", ""), hit_act=rec.get("hit"),
         after_down=rec.get("down", False), distance=rec.get("dist"), cornered=rec.get("corner", False),
         own_names={int(act): name for act, name in rec.get("vn", {}).items()},
@@ -939,12 +1000,14 @@ def analyze_damage_patterns(
         if e.damage_pct >= BIG_DAMAGE:
             when = _fmt_time(e.time_sec) if e.video_sec is None else f"動画 {_fmt_time(e.video_sec)}"
             line = f"  大ダメージ: {when} / {e.damage_pct*100:.0f}%被弾"
-            if e.hits:
-                line += f"（{e.hits}ヒット）"
+            if e.combo_hits:
+                line += f"（{e.combo_hits}ヒット）"
+            elif e.hits:
+                line += f"（HP減少 {e.hits}フレーム）"
             if e.prev_inputs:
                 line += f" / 直前→{e.what_was_doing()}"
             if e.opp_move:
-                line += f" / 相手→{e.opp_move}"
+                line += f" / 相手→{e.opp_move}" + ("（時間差で命中）" if e.opp_delayed else "")
             if e.distance is not None:
                 line += f" / {DIST_LABELS[distance_band(e.distance)]}" + ("・画面端" if e.cornered else "")
             results.append(line)
@@ -2423,7 +2486,8 @@ def _build_breakdown_section(
 {_build_breakdown_table(dealt, "自分の始動技", opp_head)}
 </div>
 <div style="color:#888;font-size:.75rem">コンボは1回として、最初に当たった技で数えています。
-射撃は出した後に当たるので、後から出した別の技として数えることがあります。
+打撃は、当たった時にまだ出していたものだけを数えます。相手が技を出し終えた後に当たった被弾は、
+その前に出していた射撃・スキルなど（弾が後から当たる技）を始動技と推定しています。
 {note}</div>
 </div>"""
 
