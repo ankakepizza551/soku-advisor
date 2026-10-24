@@ -38,6 +38,7 @@ if (Test-Path "build") { Remove-Item -Recurse -Force "build" }
     --add-data "soku_live_reader.py;." `
     --add-data "char_advisor.py;." `
     --add-data "ai_advisor.py;." `
+    --add-data "coaching.py;." `
     --add-data "char_data.json;." `
     --add-data "card_data.json;." `
     --add-data "chart.umd.min.js;." `

@@ -236,7 +236,40 @@ def get_session_count(player_name: str) -> int:
     return len(history.get("sessions", []))
 
 
+MAX_COACHING = 100   # 改善課題の記録を残す回数
+
+
+def _coaching_path(player_name: str) -> Path:
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    return HISTORY_DIR / f"{_safe_name(player_name)}.coaching.json"
+
+
+def load_coaching(player_name: str) -> list[dict]:
+    """これまでの改善課題の記録（古い順）。無い・壊れている時は空"""
+    path = _coaching_path(player_name)
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("entries", [])
+    except Exception:
+        return []
+
+
+def save_coaching(player_name: str, source: str, entry: dict) -> None:
+    """今回の改善課題と、その指標の値を足して保存する。同じ記録から作り直した時は前の分を置き換える。
+
+    中身は {"chars": [自分, 相手], "matches": 試合数, "issues": [coaching.snapshot(...), ...]}。
+    """
+    entries = [e for e in load_coaching(player_name) if e.get("source") != source]
+    entries.append({"date": datetime.now().isoformat(timespec="seconds"), "source": source, **entry})
+    _coaching_path(player_name).write_text(
+        json.dumps({"version": 1, "player_name": player_name, "entries": entries[-MAX_COACHING:]},
+                   ensure_ascii=False, indent=1),
+        encoding="utf-8",
+    )
+
+
 def clear_history(player_name: str) -> None:
-    for path in (_history_path(player_name), _events_path(player_name)):
+    for path in (_history_path(player_name), _events_path(player_name), _coaching_path(player_name)):
         if path.exists():
             path.unlink()

@@ -29,6 +29,7 @@ import cv2
 import numpy as np
 
 from char_advisor import generate_char_advice, normalize_char_id, char_display_name
+import coaching as coach
 from ai_advisor import ai_available, build_ai_payload, generate_ai_advice, _stats_summary
 
 class AnalyzeError(Exception):
@@ -2361,6 +2362,15 @@ table th, table td{{padding:4px 8px; border-bottom:1px solid #222}}
 .session-table{{width:100%;font-size:.85rem;border-collapse:collapse;margin-top:8px}}
 .ai-text p{{margin-bottom:12px;line-height:1.65;font-size:.9rem;color:#ddd}}
 .ai-text ul{{margin:8px 0 8px 20px;font-size:.88rem;color:#ccc}}
+.coach-issue{{background:#16162a; border-left:3px solid var(--accent); border-radius:0 6px 6px 0; padding:10px 14px; margin-bottom:12px; font-size:.86rem; line-height:1.6}}
+.coach-issue h3{{color:var(--accent); font-size:.95rem; margin-bottom:6px}}
+.coach-issue dt{{color:#aaa; font-size:.78rem; margin-top:6px}}
+.coach-issue dd{{margin-left:0}}
+.coach-issue details{{margin-top:8px; background:#1f1f36; border-radius:6px; padding:6px 10px}}
+.coach-issue summary{{cursor:pointer; color:var(--accent)}}
+.coach-issue ol, .coach-issue ul{{margin:4px 0 4px 20px}}
+.tag{{display:inline-block; font-size:.7rem; padding:1px 6px; border-radius:8px; margin-left:4px; background:#333; color:#ddd}}
+.tag-confirmed{{background:#2e5d34}} .tag-estimated{{background:#6b5a1e}} .tag-unknown{{background:#555}}
 .video-card{{position:sticky; top:0; z-index:5; margin-bottom:16px; text-align:center; box-shadow:0 4px 12px rgba(0,0,0,.5)}}
 .video-card video{{max-width:100%; max-height:42vh; background:#000; border-radius:6px}}
 .video-card .hint{{color:#888; font-size:.75rem; margin-top:4px}}
@@ -2376,6 +2386,8 @@ a.seek:hover{{color:#fff}}
 {video_section}
 
 {overview_section}
+
+{coaching_section}
 
 <div class="grid">
 <div class="card">
@@ -2490,6 +2502,86 @@ def _build_breakdown_section(
 その前に出していた射撃・スキルなど（弾が後から当たる技）を始動技と推定しています。
 {note}</div>
 </div>"""
+
+
+CAUSE_TAGS = {"確認済み": "tag-confirmed", "推定": "tag-estimated", "特定できない": "tag-unknown"}
+
+
+def _scene_link(scene: "coach.Scene", has_video: bool, multi: bool) -> str:
+    """根拠の場面。動画に時刻合わせできた場面だけ、その場面へ飛ぶリンクにする（時刻を作らない）"""
+    clock = _fmt_clock(scene.match_sec)
+    label = (f"試合{scene.match} " if multi else "") + f"{clock}頃・{scene.damage * 100:.0f}%"
+    if has_video and scene.video_sec is not None:
+        return _seek_link(scene.video_sec, html.escape(label) + "（動画）", scene.video_index)
+    return html.escape(label) + '<span style="color:#888">（記録の時刻）</span>'
+
+
+def _build_coaching_section(coaching: Optional["coach.Coaching"], has_video: bool, multi: bool) -> str:
+    """改善課題・練習メニュー・次の対戦で意識すること・前回の課題の振り返り"""
+    if coaching is None or not (coaching.issues or coaching.notes or coaching.reviews):
+        return ""
+    e = html.escape
+    parts = ['<div class="card" style="margin-bottom:16px"><h2>🧭 改善課題と練習メニュー</h2>']
+    for n, issue in enumerate(coaching.issues, start=1):
+        m = issue.menu
+        scenes = " / ".join(_scene_link(s, has_video, multi) for s in issue.scenes)
+        parts.append(
+            f'<div class="coach-issue"><h3>課題{n}: {e(issue.title)}'
+            f'<span class="tag">確信度 {e(issue.confidence)}</span></h3><dl>'
+            f'<dt>根拠<span class="tag tag-confirmed">確認済み</span></dt><dd>'
+            + "<br>".join(e(line) for line in issue.evidence)
+            + (f"<br>主な場面: {scenes}" if scenes else "")
+            + f'</dd><dt>考えられる原因<span class="tag {CAUSE_TAGS.get(issue.cause_level, "")}">'
+            f'{e(issue.cause_level)}</span></dt><dd>{e(issue.cause)}</dd>'
+            f'<dt>改善案</dt><dd>{e(issue.suggestion)}</dd>'
+            f'<dt>確認方法</dt><dd>{e(issue.check)}</dd>'
+            f'<dt>続いている課題か</dt><dd>{e(issue.persistence)}</dd>'
+            f'<dt>確信度の理由</dt><dd>{e(issue.confidence_reason)}</dd>'
+            + "".join(f'<dd style="color:#aaa">{e(note)}</dd>' for note in issue.notes)
+            + f'</dl><details><summary>練習メニュー: {e(m.name)}'
+            f'<span class="tag">一般的な練習案</span></summary><dl>'
+            f'<dt>目的</dt><dd>{e(m.purpose)}</dd><dt>対象の課題</dt><dd>{e(m.target)}</dd>'
+            f'<dt>手順</dt><dd><ol>' + "".join(f"<li>{e(s)}</li>" for s in m.steps) + '</ol></dd>'
+            f'<dt>練習中に意識すること</dt><dd><ul>' + "".join(f"<li>{e(s)}</li>" for s in m.focus) + '</ul></dd>'
+            f'<dt>成功条件・評価指標</dt><dd>{e(m.success)}</dd>'
+            f'<dt>実戦で試すこと</dt><dd>{e(m.in_match)}</dd>'
+            f'<dt>リプレイで確認すること</dt><dd>{e(m.replay_check)}</dd></dl></details></div>'
+        )
+    if coaching.goals:
+        parts.append('<h3 style="color:var(--accent);font-size:.95rem;margin:12px 0 6px">🎯 次の対戦で意識すること</h3>'
+                     '<ul class="advice-list">' + "".join(f"<li>{e(g)}</li>" for g in coaching.goals) + "</ul>")
+    if coaching.reviews:
+        parts.append('<h3 style="color:var(--accent);font-size:.95rem;margin:12px 0 6px">📈 前回の課題の振り返り</h3>'
+                     '<table class="session-table"><tr><th style="text-align:left">前回の課題</th><th>判定</th>'
+                     '<th style="text-align:left">根拠</th><th style="text-align:left">次に試すこと</th></tr>'
+                     + "".join(f"<tr><td>{e(r.title)}</td><td style=\"text-align:center\"><b>{e(r.status)}</b></td>"
+                               f"<td>{e(r.detail)}</td><td>{e(r.next_step)}</td></tr>" for r in coaching.reviews)
+                     + "</table>")
+    for note in coaching.notes:
+        parts.append(f'<div style="color:#e0a020;font-size:.82rem;margin-top:8px">{e(note)}</div>')
+    parts.append(
+        '<div style="color:#888;font-size:.75rem;margin-top:8px">'
+        "課題は、取られたダメージの割合・何試合で起きたか・回数・データの確かさ・練習で変えやすいかを"
+        "掛け合わせて順位を付け、上位を出しています。根拠の数字は記録から直接数えたものです。"
+        "原因は記録で確かめられた範囲だけを書き、分からない時は「特定できない」としています。"
+        "練習メニューは試す価値のある候補で、正解の行動を示すものではありません。</div></div>"
+    )
+    return "".join(parts)
+
+
+def _sum_guard_stats(stats: list) -> "LiveStats":
+    """試合ごとの LiveStats から、改善課題に使うガードと位置の集計だけを足し合わせる"""
+    total = LiveStats()
+    for s in stats:
+        if s is None:
+            continue
+        for k, v in s.guard_counts.items():
+            total.guard_counts[k] = total.guard_counts.get(k, 0) + v
+        for k in total.wrong_guard_moves:
+            total.wrong_guard_moves[k].update(s.wrong_guard_moves[k])
+        total.pos_frames += s.pos_frames
+        total.cornered_frames += s.cornered_frames
+    return total
 
 
 def _build_card_table(cs: CardSummary, player: int, name: str) -> str:
@@ -3015,6 +3107,7 @@ def build_html(
     overview: Optional[list[str]] = None,
     video_srcs: Optional[list[str]] = None,
     video_labels: Optional[list[str]] = None,
+    coaching: Optional["coach.Coaching"] = None,
 ) -> str:
     """video_src（レポートから見た動画の場所）があれば動画を埋め込み、to_video で
     再生位置が分かる時刻をクリックで飛べるようにする。
@@ -3169,6 +3262,7 @@ def build_html(
             f"{OVERVIEW_MIN_COUNT}回以上か、合計{OVERVIEW_MIN_DAMAGE * 100:.0f}%以上のものだけ載せています。"
             "詳しくは下の「被弾の内訳」とアドバイスを見てください。</div></div>"
         ) if overview else "",
+        coaching_section=_build_coaching_section(coaching, bool(video_src), multi),
         seek_lead=SEEK_LEAD_SEC,
         video_srcs_json=json.dumps(video_srcs).replace("</", "<\\/"),
         video_labels_json=json.dumps(
@@ -3702,6 +3796,18 @@ def analyze(
     for line in overview:
         print(f"  [総評] {line}")
 
+    # ── 改善課題・練習メニュー（ライブ記録のみ）。失敗してもレポートは作る
+    coaching: Optional[coach.Coaching] = None
+    if live_frames:
+        try:
+            coaching = _coaching_for(
+                matches, damage_events, self_stats, all_hp, viewpoint, bool(video_path),
+                _hist_name if use_history else None, "+".join(_keys) if use_history else "",
+                (self_char, opp_char),
+            )
+        except Exception as e:      # 改善課題が作れなくても、ほかの欄はそのまま出す
+            print(f"  [改善課題] 作れませんでした: {e}")
+
     # ── HTML 出力
     html = build_html(
         video_path, rounds, all_hp, rep, advice, p1_name, p2_name,
@@ -3721,6 +3827,7 @@ def analyze(
         career_events=career_events,
         career_scope=career_scope,
         overview=overview,
+        coaching=coaching,
         # 試合ごとにキャラが違う時は、見出しには出さず各試合の欄に出す
         char_label=(
             f"{char_display_name(p1_char)} vs {char_display_name(p2_char)}"
@@ -3731,6 +3838,59 @@ def analyze(
     out_path.write_text(html, encoding="utf-8")
     print(f"  レポート出力: {out_path}")
     return out_path
+
+
+def _coaching_for(
+    matches: list[MatchData],
+    damage_events: list[DamageEvent],
+    self_stats: Optional[LiveStats],
+    all_hp: list,
+    viewpoint: int,
+    has_video: bool,
+    player: Optional[str],
+    source: str,
+    chars: tuple,
+) -> "coach.Coaching":
+    """改善課題を作り、履歴があれば前回の課題と比べ、今回の課題を履歴に残す"""
+    self_side = "p1" if viewpoint == 1 else "p2"
+    if len(matches) > 1:
+        # 被弾の内訳と同じく、一番多いキャラの組み合わせの試合だけを見る（技の番号はキャラで違う）
+        group, _ = main_matchup(matches)
+        inputs = [coach.MatchInput(m.match_num, m.start_sec, m.damage_events,
+                                   m.live_p1 if viewpoint == 1 else m.live_p2, m.video_index)
+                  for m in group]
+        stats = _sum_guard_stats([i.stats for i in inputs])
+        chars = (group[0].p1_char, group[0].p2_char)[::1 if viewpoint == 1 else -1]
+    else:
+        start = all_hp[0][0] if all_hp else 0.0
+        inputs = [coach.MatchInput(1, start, damage_events, self_stats, 0 if has_video else None)]
+        stats = self_stats
+    result = coach.build_coaching(inputs, self_side, _act_name, stats)
+    for issue in result.issues:
+        print(f"  [改善課題] {issue.title}（確信度 {issue.confidence}・{issue.count}回・{issue.damage * 100:.0f}%）")
+    if not player:
+        return result
+
+    # 前回の課題と比べる（同じ記録を作り直した時は、その記録自身とは比べない）
+    import player_history as ph
+    try:
+        history = [h for h in ph.load_coaching(player) if h.get("source") != source]
+        if history:
+            last = history[-1]
+            same = tuple(last.get("chars") or ()) == tuple(chars)
+            for previous in last.get("issues", []):
+                now = coach.measure(previous["key"], inputs, self_side, _act_name, stats)
+                result.reviews.append(coach.compare(previous, now, same))
+        ph.save_coaching(player, source, {
+            "chars": list(chars),
+            "matches": len(inputs),
+            "issues": [coach.snapshot(i, coach.measure(i.key, inputs, self_side, _act_name, stats))
+                       for i in result.issues],
+        })
+    except Exception as e:      # 履歴が読めない・書けない時も、レポートは作る
+        print(f"  [改善課題] 履歴を扱えませんでした: {e}")
+        result.notes.append("前回の課題の履歴を読み書きできなかったため、振り返りは出していません")
+    return result
 
 
 def main() -> None:
